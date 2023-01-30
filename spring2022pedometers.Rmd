@@ -1,0 +1,176 @@
+---
+title: "pedometer data"
+author: "Maria Stahl"
+date: "9/26/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(data.table)
+library(ggplot2)
+library(ggpubr)
+library(suncalc)
+library(tidyverse)
+```
+
+### read in csv
+```{r}
+spring_activity = read.csv('spring2022pedometers.csv')
+fall_activity = read.csv('fall2022pedometers.csv')
+
+```
+
+### clean/organize csv
+```{r}
+### Drill enter/exit dates
+spring_firstday =  as.POSIXct('2022-03-16 00:00:00')
+spring_lastday = as.POSIXct('2022-04-07 00:00:00')
+fall_firstday = as.POSIXct('2022-11-16 00:00:00')
+fall_lastday = as.POSIXct('2022-12-07 00:00:00')
+
+### remove all data outside Drill dates
+spring_activity = spring_activity %>%
+  filter(Start > spring_firstday & Start < spring_lastday)
+fall_activity = fall_activity %>%
+  filter(Start > fall_firstday & Start < fall_lastday)
+
+### combine dataframes
+activity = rbind(spring_activity, fall_activity)
+
+### add Season column
+activity = activity %>% 
+  mutate(Season = case_when(month(Start) == 3 ~  'Spring',
+                            month(Start) == 4 ~  'Spring',
+                            month(Start) == 11 ~  'Fall',
+                            month(Start) == 12 ~  'Fall')) %>%
+  mutate(Start = as.POSIXct(Start))
+
+### separate breed and collar id
+activity$Breed = ifelse(substr(activity$Cow, 1,1) == 'A', 'Angus',
+                             'Criollo')
+activity$Tag = activity$Cow %>%
+  stringr::str_replace(activity$Breed, '') %>% 
+  as.factor()
+activity$Breed = as.factor(activity$Breed)
+
+### create date column
+activity$Date = activity$Start %>%
+  format('%Y-%m-%d')
+
+### create time column
+activity$Time = activity$Start %>%
+  as.ITime(format = '%H:%M:%S')
+```
+
+###### START HERE ######
+
+### calculate daily steps and run t-test
+```{r}
+daily.steps = tapply(X = activity$Steps, 
+                        INDEX = list(activity$Tag, activity$Date),
+                        FUN = sum) %>%
+  as.data.frame()
+
+tag.breed = activity %>%
+  dplyr::select(c(Tag, Breed)) %>%
+  distinct()
+
+daily.steps = cbind(daily.steps, tag.breed)
+
+daily.steps = daily.steps %>%
+  pivot_longer(cols = 1:43, names_to = 'Date', values_to = 'Steps') %>%
+  mutate(Date = as.POSIXct(Date)) %>%
+  filter(!is.na(Steps))
+
+# add Season column
+daily.steps = daily.steps %>% 
+  mutate(Season = case_when(month(Date) == 3 ~  'Spring',
+                            month(Date) == 4 ~  'Spring',
+                            month(Date) == 11 ~  'Fall',
+                            month(Date) == 12 ~  'Fall')) %>%
+  mutate(Date = as.POSIXct(Date))
+
+### run anova
+steps.lm = lm(Steps ~ Breed * Season, data = daily.steps)
+summary(steps.lm)
+
+### make graph
+ggplot() +
+  geom_boxplot(data = daily.steps, aes(x = Season, y = Steps, fill = Breed)) +
+  stat_compare_means(data = daily.steps, aes(x = Season, y = Steps,
+                                             group = Breed),
+                     label = 'p.format')
+
+```
+
+### look at daytime movement only
+```{r}
+### calculate sun position for each entry in `activity`
+sunlight = getSunlightPosition(date = activity$Start, 
+                    lat = 38.147505, 
+                    lon = -109.608854)
+
+### add Daytime column to activity df (logical)
+activity = activity %>%
+  mutate(Daytime = sunlight$altitude > 0)
+
+daytime.activity = activity %>%
+  filter(Daytime == T)
+
+# create data.frame
+daytime.steps = tapply(X = daytime.activity$Steps, 
+                        INDEX = list(daytime.activity$Tag, daytime.activity$Date),
+                        FUN = sum) %>%
+  as.data.frame()
+
+tag.breed = daytime.activity %>%
+  dplyr::select(c(Tag, Breed)) %>%
+  distinct()
+
+daytime.steps = cbind(daytime.steps, tag.breed)
+
+daytime.steps = daytime.steps %>%
+  pivot_longer(cols = 1:43, names_to = 'Date', values_to = 'Steps') %>%
+  mutate(Date = as.POSIXct(Date)) %>%
+  filter(!is.na(Steps))
+
+# add Season column
+daytime.steps = daytime.steps %>% 
+  mutate(Season = case_when(month(Date) == 3 ~  'Spring',
+                            month(Date) == 4 ~  'Spring',
+                            month(Date) == 11 ~  'Fall',
+                            month(Date) == 12 ~  'Fall')) %>%
+  mutate(Date = as.POSIXct(Date))
+
+### run anova
+daytime.steps.lm = lm(Steps ~ Breed * Season, data = daytime.steps)
+summary(daytime.steps.lm)
+
+### make graph
+ggplot() +
+  geom_boxplot(data = daytime.steps.lm, aes(x = Season, y = Steps, fill = Breed)) +
+  stat_compare_means(data = daytime.steps.lm, aes(x = Season, y = Steps,
+                                             group = Breed),
+                     label = 'p.format')
+```
+
+### calculate daily motion index and run t-test
+```{r}
+daily.motion = tapply(X = activity$Motion.Index, 
+                        INDEX = list(activity$Tag, activity$Date),
+                        FUN = mean) %>%
+  as.data.frame()
+
+daily.motion = cbind(daily.motion, tag.breed)
+
+daily.motion = daily.motion %>%
+  pivot_longer(cols = 1:22, names_to = 'Date', values_to = 'Motion.Index')
+
+### run t-test
+t.test(Motion.Index ~ Breed, data = daily.motion)
+
+### make graph
+ggplot() +
+  geom_boxplot(data = daily.motion, aes(x = Breed, y = Motion.Index))
+```
+

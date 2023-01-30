@@ -1,0 +1,133 @@
+---
+title: "heat map 2022"
+author: "Maria Stahl"
+date: "10/5/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+rm(list = ls())
+```
+
+## Load in Drill Pasture shapefile
+```{r}
+all_pastures1 = readOGR("Cottonwood_Allotment_and_pasture_boundaries/Cottonwood_Allotment_and_pasture_boundaries.shp")
+all_pastures_sf1 = st_read("Cottonwood_Allotment_and_pasture_boundaries/Cottonwood_Allotment_and_pasture_boundaries.shp")
+
+all_pastures2 = readOGR("Cottonwood_Allotment_and_pasture_boundaries/BLM_IndianCreekAllotment.shp")
+all_pastures_sf2 = st_read("Cottonwood_Allotment_and_pasture_boundaries/BLM_IndianCreekAllotment.shp")
+```
+
+## Read and clean ATS collar data
+```{r}
+### ATS ###
+# read in data
+cattle.dat.ATS = read.csv('../GPS Data/GPS Combined 3.15.22-10.4.22.csv')
+
+# create date_time column
+cattle.dat.ATS$Date = as.Date(cattle.dat.ATS$Julianday, 
+                              origin = '2021-12-31')
+cattle.dat.ATS$date_time = paste(cattle.dat.ATS$Hour, 
+                                 cattle.dat.ATS$Minute, sep = ':') %>%
+  paste(cattle.dat.ATS$Date, .) %>%
+  as.POSIXct(format = '%Y-%m-%d %H:%M')
+
+# add breed info
+breed.info = read.csv('../Data/collars.peds_Mar22.csv')
+names(breed.info)[3] = 'CollarSerialNumber'
+cattle.dat.ATS = cattle.dat.ATS %>%
+  merge(breed.info, by = 'CollarSerialNumber')
+
+# select necessary columns
+cattle.dat.ATS = cattle.dat.ATS %>%
+  dplyr::select(CollarSerialNumber, date_time, Latitude, Longitude, FixTime,
+         NumSats, breed)
+
+# rename column names to match previous datasheets
+names(cattle.dat.ATS)
+names(cattle.dat.ATS) = c('COLLAR', 'date_time', 'LATITUDE', 'LONGITUDE', 
+                          'DURATION', 'SATELLITES', 'BREED')
+
+# check how many individuals are in dataset
+length(levels(as.factor(cattle.dat.ATS$COLLAR)))
+
+# data in UTM
+cattle.gps = st_as_sf(cattle.dat.ATS, coords = c('LONGITUDE', 'LATITUDE'))
+st_crs(cattle.gps) = CRS("+proj=longlat +ellps=WGS84")
+cattle.gps$geometry = st_transform(cattle.gps$geometry, 
+                         crs = st_crs(all_pastures))
+
+projection(cattle.gps) == projection(all_pastures)
+
+cattle.utm = as_Spatial(cattle.gps)
+```
+
+### check shapefile boundaries
+```{r}
+ggplot() +
+  geom_sf(data = all_pastures_sf1) +
+  geom_sf(data = all_pastures_sf2) +
+  geom_sf(data = cattle.gps, alpha = 0.5)
+
+unused.pastures2 = c('?Dark Canyon Plateau', '?Fable Valley', '?Wild Cow', 
+                     '?Sweet Alice', 'Salt Creek', 'Stevens Bench', 'Ruin Park',
+                     'Park Pasture', 'Corral Pocket')
+
+all_pastures_sf2 = all_pastures_sf2 %>%
+  filter(!(UNIT %in% unused.pastures2))
+```
+
+### merge sf objects
+```{r}
+sf1 = all_pastures_sf1 %>%
+  dplyr::select(PASTURE_NA, geometry)
+names(sf1) = c('Pasture', 'geometry')
+
+sf2 = all_pastures_sf2 %>%
+  dplyr::select(Pasture, geometry)
+
+avail = rbind(sf1, sf2)
+```
+
+### clustering analysis
+```{r}
+# create 100m grid
+grid = st_make_grid(avail, cellsize = 100)
+grid_sf = grid %>%
+  st_intersection(avail) %>%
+  st_sf
+
+# count how many points in each grid cell
+cell.density.criollo = grid_sf %>% 
+  mutate(counts = lengths(st_intersects(., subset(cattle.gps, BREED == 'Criollo'))))
+cell.density.criollo$breed = 'Criollo'
+cell.density.angus = grid_sf %>% 
+  mutate(counts = lengths(st_intersects(., subset(cattle.gps, BREED == 'Angus'))))
+cell.density.angus$breed = 'Angus'
+cell_density = rbind(cell.density.angus, cell.density.criollo)
+
+# look at deciles of counts
+cuts = quantile(cell_density$counts, probs = seq(0.9, 1, 0.01))
+
+# bin counts
+cell_density$bins = cut(cell_density$counts, 
+                        breaks = c(0, 2, 20, 1834), 
+                        include.lowest = T)
+
+# map of results
+ggplot() +
+  geom_sf(data = avail) +
+  geom_sf(data = cell_density, aes(fill = bins), lwd = 0) +
+  scale_fill_brewer(palette = 'BuPu') +
+  facet_wrap(~breed)
+
+ggplot() +
+  geom_sf(data = avail) +
+  geom_sf(data = cattle.gps, alpha = .1, size = 1) +
+  facet_wrap(~BREED)
+```
+

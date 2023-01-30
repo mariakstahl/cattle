@@ -1,0 +1,1298 @@
+---
+title: "spring2022HSF"
+author: "Maria Stahl"
+date: "9/22/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+rm(list = ls())
+```
+
+## Load necessary packages
+```{r}
+library(amt)
+library(data.table)
+library(dplyr)
+library(gdata)
+library(ggplot2)
+library(glmnetUtils)
+library(hms)
+library(lme4)
+library(lubridate)
+library(purrr)
+library(raster)
+library(rgdal)
+library(rlist)
+library(sf)
+library(stats)
+library(tidyr)
+library(tmap)
+```
+
+## Load in Drill Pasture shapefile
+```{r}
+drill_pasture = readOGR("Drill_Pasture/Drill_Pasture.shp")
+drill_pasture_sf = st_read("Drill_Pasture/Drill_Pasture.shp")
+```
+
+## Load in RAP data (raster created through Google Earth Engine)
+```{r}
+veg.dat.2020.small = stack('RAP_VegCover_2020_new.tif')
+
+veg.dat.2020.new = stack('RAP3_2020.tif')
+
+# reproject RAP data to UTM
+veg.dat.2020.small =
+  raster::projectRaster(veg.dat.2020.small, 
+                        crs = crs(drill_pasture_sf))
+veg.dat.2020.small$herb = sum(veg.dat.2020.small$AFGC,
+                              veg.dat.2020.small$PFGC)
+veg.dat.2020.new =
+  raster::projectRaster(veg.dat.2020.new, crs = crs(drill_pasture))
+veg.dat.2020.new$herb = sum(veg.dat.2020.new$AFG,
+                              veg.dat.2020.new$PFG)
+
+# mask full raster stack to cover only Drill Pasture
+DPveg = mask(veg.dat.2020.new, drill_pasture)
+DPveg.new = mask(veg.dat.2020.new, drill_pasture)
+
+par(mfrow = c(1,2))
+plot(DPveg.new$SHR)
+plot(DPveg$SHR)
+```
+
+## remove areas with >25% herbaceous cover
+We do this to remove the shadow from the mesa walls
+```{r}
+herb.buffered = DPveg$herb
+herb.buffered[herb.buffered > 25] = NA
+```
+
+## Read in elevation data and calculate ruggedness and slope (elev data from https://www.sciencebase.gov/catalog/item/5f7784be82ce1d74e7d6ca12)
+```{r}
+elev_orig = raster('USGS_13_n39w110.tif')
+temp = raster(extent(drill_pasture@bbox), crs = crs(drill_pasture),
+              resolution = 10)
+elev2 = projectRaster(elev_orig, temp)
+names(elev2) = 'drill_elev'
+
+# calculate ruggedness and slope
+ruggedness = terrain(elev2, opt = 'TRI', neighbors = 8)
+slope = terrain(elev2, opt = 'slope', neighbors = 8)
+```
+
+## Read and clean ATS collar data
+```{r}
+### ATS ###
+# read in data
+cattle.dat.ATS = read.csv('GPS Combined 3.16.22 - 5.26.22.csv')
+
+# create date_time column
+cattle.dat.ATS$Date = as.Date(cattle.dat.ATS$Julianday, 
+                              origin = '2021-12-31')
+cattle.dat.ATS$date_time = paste(cattle.dat.ATS$Hour, 
+                                 cattle.dat.ATS$Minute, sep = ':') %>%
+  paste(cattle.dat.ATS$Date, .) %>%
+  as.POSIXct(format = '%Y-%m-%d %H:%M')
+
+# add breed info
+breed.info = read.csv('../Data/collars.peds_Mar22.csv')
+names(breed.info)[3] = 'CollarSerialNumber'
+cattle.dat.ATS = cattle.dat.ATS %>%
+  merge(breed.info, by = 'CollarSerialNumber')
+
+# select necessary columns
+cattle.dat.ATS = cattle.dat.ATS %>%
+  dplyr::select(CollarSerialNumber, tag_no, date_time, Latitude, Longitude, FixTime,
+         NumSats, breed)
+
+# rename column names to match previous datasheets
+names(cattle.dat.ATS)
+names(cattle.dat.ATS) = c('COLLAR', 'tag_no', 'date_time', 'LATITUDE', 'LONGITUDE', 
+                          'DURATION', 'SATELLITES', 'BREED')
+
+# check how many individuals are in dataset
+length(levels(as.factor(cattle.dat.ATS$COLLAR)))
+
+# data in UTM
+cattle.gps = st_as_sf(cattle.dat.ATS, coords = c('LONGITUDE', 'LATITUDE'))
+st_crs(cattle.gps) = CRS("+proj=longlat +ellps=WGS84")
+cattle.gps$geometry = st_transform(cattle.gps$geometry, 
+                         crs = st_crs(drill_pasture))
+
+projection(cattle.gps) == projection(drill_pasture)
+
+cattle.utm = as_Spatial(cattle.gps)
+
+# remove data points outside of Drill Pasture
+test = cattle.utm[!is.na(over(cattle.utm, as(drill_pasture,
+                                                 'SpatialPolygons'))),]
+
+# remove data points outside of buffered herb area
+selection = !is.na(over(cattle.utm, rasterToPolygons(herb.buffered)))
+DPcattle.ATS = cattle.utm[array(selection),]
+
+tm_shape(herb.buffered) + tm_raster() +
+  tm_shape(test) + tm_dots() +
+  tm_shape(drill_pasture) + tm_borders()
+
+rm(cattle.gps)
+```
+
+## Calculate distance from water and salt licks
+```{r}
+# read in KMZ file and convert to UTM
+features = read_sf('drill 2022 water and salt.kml')
+features$Name = c('trough1', 'trough2', 'trough3', 'trough4', 'seep',
+                  'pond', 'protein1', 'protein2', 'protein3', 'protein4')
+features$Description = c('water', 'water', 'water', 'water', 'water', 'water',
+                         'salt', 'salt', 'salt', 'salt')
+features$geometry = st_transform(features$geometry, crs = crs(drill_pasture_sf))
+
+indianCreek = read_sf('indian creek.kml') %>%
+  st_transform(crs = crs(drill_pasture)) %>%
+  st_cast(to = 'POINT')
+indianCreek$Description = rep('water', times = dim(indianCreek)[1])
+
+featuresAll = rbind(features, indianCreek)
+
+# create distance raster
+water = distanceFromPoints(herb.buffered,
+                           st_coordinates(filter(featuresAll, 
+                                                 Description == 'water'))[ ,1:2])
+names(water) = 'close_water'
+salt = distanceFromPoints(herb.buffered,
+                           st_coordinates(filter(featuresAll, 
+                                                 Description == 'salt'))[ ,1:2])
+names(salt) = 'close_salt'
+
+log.water = log(water)
+names(log.water) = 'log_water'
+log.salt = log(salt)
+names(log.salt) = 'log_salt'
+
+# ggplot() +
+#   geom_sf(data = drill_pasture_sf) +
+#   geom_sf(data = featuresAll, aes(color = Description))
+```
+
+## Resample and scale all covariates
+
+### THIS SHOULD BE REVISITED, PER BRIAN'S COMMENTS
+```{r}
+elev.small = raster::resample(elev2, herb.buffered, method = 'ngb') %>%
+  raster::mask(herb.buffered)
+slope.small = raster::resample(slope, herb.buffered$herb, method = 'ngb') %>%
+  raster::mask(herb.buffered)
+ruggedness.small = raster::resample(ruggedness, herb.buffered, method = 'ngb') %>%
+  raster::mask(herb.buffered)
+water.small = raster::resample(log.water, herb.buffered, method = 'ngb') %>%
+  raster::mask(herb.buffered)
+salt.small = raster::resample(log.salt, herb.buffered, method = 'ngb') %>%
+  raster::mask(herb.buffered)
+SHR.small = raster::mask(DPveg$SHR, herb.buffered)
+TREE.small = raster::mask(DPveg$TRE, herb.buffered)
+
+scaled.elev = scale(elev.small, center = T)
+scaled.slope = scale(slope.small, center = T)
+scaled.ruggedness = scale(ruggedness.small, center = T)
+names(scaled.elev) = 'drill_elev'
+names(scaled.slope) = 'slope'
+scaled.water = scale(water.small, center = T)
+scaled.salt = scale(salt.small, center = T)
+names(scaled.water) = 'log_water'
+names(scaled.salt) = 'log_salt'
+scaled.herb = scale(herb.buffered, center = T)
+scaled.SHR = scale(SHR.small, center = T)
+scaled.TREE = scale(TREE.small, center = T)
+
+# scaled.soil = resample(soilClasses2, herb.buffered, method = 'ngb') %>%
+#   scale(center = T)
+# names(scaled.soil) = 'soil_class'
+```
+
+## Calculate activity modes
+```{r}
+# create track for individuals
+DPcattle.frame = as.data.frame(DPcattle.ATS)
+DPcattle.frame = DPcattle.frame[!is.na(DPcattle.frame$date_time),]
+DPcattle.frame$tag_no = as.factor(DPcattle.frame$tag_no)
+DPcattle.list = split(DPcattle.frame, f = DPcattle.frame$tag_no)
+DPtrack = lapply(DPcattle.list, FUN = mk_track, .x = coords.x1, .y = coords.x2,
+                 .t = date_time, crs = crs(DPcattle.ATS), order_by_ts = T,
+                 check_duplicates = T)
+rm(DPcattle.list)
+
+breeds = distinct(DPcattle.frame[3:4])[order(distinct(DPcattle.frame[4])),]
+
+# calculate velocity from track
+tags = levels(DPcattle.frame$tag_no)
+DPspeed = lapply(DPtrack, FUN = speed)
+for(i in seq(1:length(tags))){
+  c = tags[i]
+  DPtrack[[c]][4] = DPspeed[[c]]
+  names(DPtrack[[c]])[4] = 'speed'
+}
+
+# convert list back into data.frame
+DPspeed.frame = list.rbind(DPtrack)
+temp = array()
+for(i in seq(1:length(tags))){
+  temp = append(temp, rep(tags[i], times = dim(DPtrack[[i]])[1]))
+}
+temp = temp[!is.na(temp)]
+DPspeed.frame$tag_no = temp
+names(DPspeed.frame)[3] = 'date_time'
+rm(DPtrack)
+
+# merge DPcattle.frame and DPspeed.frame
+DPcattle.frame = merge(DPcattle.frame, DPspeed.frame, 
+                       by = c('tag_no','date_time'))
+
+# classify activity based on speed (from Nyamuryekung'e et al. 2021a)
+resting = 2.34/60 # max resting speed in m/s
+grazing = 25/60 # max grazing speed in m/s
+DPcattle.frame$activity = array()
+DPcattle.frame$activity[DPcattle.frame$speed <= resting] = 'resting'
+DPcattle.frame$activity[DPcattle.frame$speed > resting &
+                          DPcattle.frame$speed <= grazing] = 'grazing'
+DPcattle.frame$activity[DPcattle.frame$speed > grazing] = 'traveling'
+DPcattle.frame$time = as_hms(DPcattle.frame$date_time)
+
+DPcattle.track = mk_track(DPcattle.frame, .x = coords.x1, .y = coords.x2, 
+                          .t = date_time, tag_no = tag_no, COLLAR = COLLAR, 
+                          BREED = BREED, SATELLITES = SATELLITES, speed = speed, 
+                          activity = activity, time = time, date = date_time)
+
+```
+
+## Prepare all data for model selection
+```{r}
+# create grid of available points
+# avail.border = st_difference(drill_pasture_sf, buffer) %>%
+#   as_Spatial()
+avail = as.data.frame(herb.buffered, xy = T)
+avail$case_ = rep(0, dim(avail)[1])
+avail = avail[,-3]
+names(avail) = c('x_', 'y_', 'case_')
+avail.small = avail[seq(1,dim(avail)[1],100),] # select every 100th pt
+
+# remove points from first and last three days
+entry = sort(DPcattle.track$date, na.rm = T)[7]
+exit = as.POSIXct("2022-04-07 09:00:00 MDT")
+DPcattle.track.cropped = DPcattle.track %>%
+  filter(date > (entry + 3) & date < exit)
+DPcattle.frame.cropped = as.data.frame(DPcattle.track.cropped)
+
+# create separate datasets for each activity level for each invididual
+all.list = split(x = DPcattle.track.cropped, 
+                 f = as.factor(DPcattle.track.cropped$tag_no))
+all.list = lapply(all.list, `[`, c(1,2))
+```
+
+## LASSO MODEL
+```{r}
+# set.seed(seed = 1)
+# 
+# HSFmodel = function(used, avail) {
+#   used$case_ = 1
+#   avail$case_ = 0
+#   all.points = rbind(used, avail)
+#   all.points = all.points  %>%
+#     # attach env covariates to observed and available pts
+#     extract_covariates(scaled.elev) %>%
+#     extract_covariates(scaled.slope) %>%
+#     extract_covariates(scaled.water) %>%
+#     extract_covariates(scaled.salt) %>%
+#     extract_covariates(scaled.herb) %>%
+#     extract_covariates(scaled.SHR) %>%
+#     mutate(w = ifelse(case_, 1, 1e3))
+#   model = glmnetUtils::cv.glmnet(case_ ~ drill_elev + slope +
+#                                    log_water + log_salt + herb + SHR,
+#               data = all.points, weights = w,
+#                    family = binomial(link = 'logit'))
+#   return(model)
+# }
+# all.model.list = lapply(X = all.list, FUN = HSFmodel, avail = avail)
+# 
+# indiv = names(all.model.list)
+# 
+# cf.all = data.frame(matrix(nrow = 7, ncol = 0))
+# for(i in seq(1:length(indiv))){
+#   coef = as.data.frame(as.array(coef(all.model.list[[i]])))
+#   names(coef) = indiv[i]
+#   cf.all = cbind(cf.all, coef)
+# }
+# write.csv(cf.all, 'coefficientsAll.LASSO.csv')
+
+```
+
+## CREATE USE INTENSITY RASTER
+```{r}
+# createRaster = function(coef) {
+#   rest.raster =
+#     scaled.elev * coef[2] +
+#     scaled.slope * coef[3] +
+#     scaled.water * coef[4] +
+#     scaled.salt * coef[5] +
+#     scaled.herb * coef[6] +
+#     scaled.SHR * coef[7]
+#   rest.raster = exp(rest.raster)
+#   rest.raster = rest.raster / sum(as.data.frame(rest.raster, na.rm = T))
+#   return(rest.raster)
+# }
+# 
+# # create is.angus and is.criollo variable
+# is.angus = array(dim = length(indiv))
+# is.criollo = array(dim = length(indiv))
+# for(i in seq(1:length(indiv))){
+#  breed = subset(breed.info, CollarSerialNumber == indiv[i])$breed 
+#  is.angus[i] = breed == 'Angus'
+#  is.criollo[i] = breed == 'Criollo'
+# }
+# 
+# MasterRasterSimple = stack(apply(X = cf.all, FUN = createRaster, MARGIN = 2))
+# MeanAngusAll = calc(MasterRasterSimple[[which(is.angus == 1)]], fun = mean)
+# MeanCriolloAll = calc(MasterRasterSimple[[which(is.criollo == 1)]], fun = mean)
+# MasterRasterSimple = addLayer(MasterRasterSimple, c(MeanAngusAll, MeanCriolloAll))
+# names(MasterRasterSimple) = c(indiv, 'Angus', 'Criollo')
+# plot((MasterRasterSimple[[39:40]]))
+# MasterFrameAll = as.data.frame(MasterRasterSimple, xy = T) %>%
+#   pivot_longer(cols = 3:(length(indiv)+4))
+# names(MasterFrameAll) = c('x', 'y', 'BREED', 'value')
+# 
+# ggplot() +
+#   geom_raster(data = subset(MasterFrameAll, BREED == 'Angus' |
+#                               BREED == 'Criollo'),
+#               aes(x = x, y = y, fill = value)) +
+#   scale_fill_viridis_c(na.value = 'white', option = 'turbo', direction = 1,
+#                        trans = 'log') +
+#   geom_sf(data = features, aes(color = Description)) +
+#   #    geom_sf(data = roads, color = 'white') +
+#   coord_sf(datum = sf::st_crs(drill_pasture)) +
+#   facet_wrap(~BREED) + 
+#   scale_x_continuous(breaks = seq(621000, 624000, length.out = 2)) +
+#   scale_y_continuous(breaks = seq(4221000, 4225000, length.out = 3)) +
+#   theme(text = element_text(color = "black", size = 20),
+#         legend.key.size = unit(1.5, 'cm')) +
+#   labs(title = 'Mean Relative Use Intensity', fill = 'Log(Intensity)')
+# 
+# ggplot() +
+#   geom_sf(data = drill_pasture_sf) +
+#   geom_point(data = DPcattle.track.cropped, aes(x = x_, y = y_),
+#              size = 0.1, alpha = 0.1) +
+#   geom_sf(data = features, aes(color = Description)) +
+#   coord_sf(datum = sf::st_crs(drill_pasture)) +
+#   facet_wrap(~BREED) + 
+#   scale_x_continuous(breaks = seq(621000, 624000, length.out = 2)) +
+#   scale_y_continuous(breaks = seq(4221000, 4225000, length.out = 3)) +
+#   theme(text = element_text(color = "black", size = 20),
+#         legend.key.size = unit(1.5, 'cm'))
+# 
+# # ggsave('log relative use.png', plot = last_plot(),
+# #   width = 10, height = 7, units = 'in', dpi = 300, limitsize = TRUE)
+# # 
+# # k =  projectRaster(log(MasterRasterSimple[[10]]),
+# #                    crs="+proj=longlat +datum=WGS84", method='ngb')
+# # KML(k, filename = 'Angus', overwrite = T)
+# # l =  projectRaster(log(MasterRasterSimple[[11]]),
+# #                    crs="+proj=longlat +datum=WGS84", method='ngb')
+# # KML(l, filename = 'Criollo', overwrite = T)
+
+```
+
+## HSF 2: all individuals together, linear mixed model with breed as interaction
+```{r}
+
+# reorganize data from list into dataframe
+HSFdata.frame = DPcattle.track.cropped %>%
+  dplyr::select(c(x_, y_, tag_no, BREED))
+
+# create all.avail dataframe (40x longer than avail dataframe)
+all.avail = do.call("rbind", replicate(length(all.list), avail, simplify = FALSE))
+all.avail$BREED = rep(breed.info$breed, each = dim(avail)[1])
+all.avail$tag_no = rep(breed.info$tag_no, each = dim(avail)[1])
+
+set.seed(seed = 1)
+
+HSFmodel.combined = function(used, all.avail) {
+  used$case_ = 1
+  all.avail$case_ = 0
+  all.points = rbind(used, all.avail)
+  all.points = all.points  %>%
+    # attach env covariates to observed and available pts
+    extract_covariates(scaled.elev) %>%
+    extract_covariates(scaled.slope) %>%
+    extract_covariates(scaled.water) %>%
+    extract_covariates(scaled.salt) %>%
+    extract_covariates(scaled.herb) %>%
+    extract_covariates(scaled.SHR) %>%
+    mutate(w = ifelse(case_, 1, 1e3))
+  model = glmer(case_ ~ drill_elev + slope + log_water + log_salt + herb + SHR +
+                 BREED:drill_elev + BREED:slope + 
+                 BREED:log_water + BREED:log_salt + 
+                 BREED:herb + BREED:SHR + (1|tag_no),
+              data = all.points, weights = w,
+                   family = binomial(link = 'logit'))
+  return(model)
+}
+
+combined.HSF = HSFmodel.combined(HSFdata.frame, all.avail)
+
+summary(combined.HSF)
+
+```
+
+## CREATE USE INTENSITY RASTER
+```{r}
+coef = summary(combined.HSF)$coef[,1]
+
+criollo.HSF.raster = coef[1] +
+  scaled.elev * coef[2] +
+  scaled.slope * coef[3] +
+  scaled.water * coef[4] +
+  scaled.salt * coef[5] +
+  scaled.herb * coef[6] +
+  scaled.SHR * coef[7] +
+  scaled.elev * (coef[2] + coef[8]) +
+  scaled.slope * (coef[3] + coef[9]) +
+  scaled.water * (coef[4] + coef[10]) +
+  scaled.salt * (coef[5] + coef[11]) +
+  scaled.herb * (coef[6] + coef[12]) +
+  scaled.SHR * (coef[7] + coef[13])
+
+criollo.HSF.raster = exp(criollo.HSF.raster)
+criollo.HSF.raster = criollo.HSF.raster / sum(as.data.frame(criollo.HSF.raster, na.rm = T))
+
+angus.HSF.raster = coef[1] +
+  scaled.elev * coef[2] +
+  scaled.slope * coef[3] +
+  scaled.water * coef[4] +
+  scaled.salt * coef[5] +
+  scaled.herb * coef[6] +
+  scaled.SHR * coef[7]
+
+angus.HSF.raster = exp(angus.HSF.raster)
+angus.HSF.raster = angus.HSF.raster / sum(as.data.frame(angus.HSF.raster, na.rm = T))
+
+combined.HSF.raster = stack(criollo.HSF.raster, angus.HSF.raster)
+combined.HSF.df = as.data.frame(combined.HSF.raster, xy = T) %>%
+  rename(., criollo = layer.1, angus = layer.2) %>%
+  pivot_longer(cols = 3:4, names_to = 'BREED', values_to = 'value')
+
+ggplot() +
+  geom_raster(data = combined.HSF.df,
+              aes(x = x, y = y, fill = value)) +
+  scale_fill_viridis_c(na.value = 'white', option = 'inferno', direction = 1,
+                       trans = 'log') +
+  # geom_point(data = DPcattle.track.cropped, aes(x = x_, y = y_),
+  #            alpha = 0.2, size = 0.1) +
+  # geom_sf(data = roads, color = 'white') +
+  coord_sf(datum = sf::st_crs(drill_pasture)) +
+  facet_wrap(~BREED) + 
+  scale_x_continuous(breaks = seq(621000, 624000, length.out = 2)) +
+  scale_y_continuous(breaks = seq(4221000, 4225000, length.out = 3)) +
+  theme(text = element_text(color = "black", size = 20),
+        legend.key.size = unit(1.5, 'cm')) +
+  labs(title = 'Relative Use Intensity', fill = 'Log(Intensity)')
+
+ggsave('log relative use.png', plot = last_plot(),
+  width = 10, height = 7, units = 'in', dpi = 300, limitsize = TRUE)
+# 
+# k =  projectRaster(log(MasterRasterSimple[[10]]),
+#                    crs="+proj=longlat +datum=WGS84", method='ngb')
+# KML(k, filename = 'Angus', overwrite = T)
+# l =  projectRaster(log(MasterRasterSimple[[11]]),
+#                    crs="+proj=longlat +datum=WGS84", method='ngb')
+# KML(l, filename = 'Criollo', overwrite = T)
+
+```
+
+## CLUSTERING ANALYSIS: 100x100m grid
+```{r}
+# create 100m grid
+grid = st_make_grid(drill_pasture_sf, cellsize = 100)
+grid_sf = grid %>%
+  st_intersection(drill_pasture_sf) %>%
+  st_sf
+
+# convert points into sf format
+DP_points_sf = DPcattle.frame.cropped %>%
+  st_as_sf(coords = c('x_', 'y_'), crs = projection(drill_pasture))
+
+# count how many points in each grid cell
+cell.density.all = grid_sf %>% 
+  mutate(counts = lengths(st_intersects(., DP_points_sf)))
+
+# remove all grid cells with 0 points
+sub.grid = grid_sf[cell.density.all$counts > 0,]
+AOI = st_union(sub.grid)
+
+# calculate criollo and angus density in area
+cell.density.criollo = grid_sf %>% 
+  mutate(criollo.counts = 
+           lengths(st_intersects(., subset(DP_points_sf, BREED == 'Criollo'))))
+cell.density.angus = grid_sf %>% 
+  mutate(angus.counts = 
+           lengths(st_intersects(., subset(DP_points_sf, BREED == 'Angus'))))
+cell_density100 = grid_sf %>% 
+  mutate(counts = 
+           lengths(st_intersects(., DP_points_sf)),
+         criollo.counts = cell.density.criollo$criollo.counts,
+         angus.counts = cell.density.angus$angus.counts)
+# look at deciles of counts
+quantile(cell_density100$criollo.counts, probs = seq(0, 1, 0.1))
+quantile(cell_density100$angus.counts, probs = seq(0, 1, 0.1))
+quantile(cell_density100$counts, probs = seq(0, 1, 0.1))
+
+# reshape dataframe for plotting
+density.frame = cell_density100 %>%
+  rename(criollo = criollo.counts, angus = angus.counts) %>%
+  pivot_longer(cols = 1:2, names_to = 'breed', values_to = 'counts')
+
+# bin counts
+density.frame$bins = cut(density.frame$counts,
+                        breaks = c(0, 1, 10, 30, 80, 150, 1000),
+                        include.lowest = T)
+# # add age to water
+# featuresAll$Age = ifelse(featuresAll$Description == 'water', 
+#                          ifelse(featuresAll$Name == 'indian creek', 
+#                                 'Old', 'new'), NA)
+
+# map of results
+colors = c("#c8c8c8", "#b4b5c2", "#a1a1bc", "#8d8eb7", "#7a7ab1", "#6667ab")
+colors2 = c("#c8c8c8", "#bbafb3", "#ae969e", "#a27e88", "#956573", "#884c5e")
+colors3 = c("#c8c8c8", "#bbc0bd", "#aeb9b3", "#a0b1a8", "#93aa9e", "#86a293")
+colors4 = c("#ffffff", "#d9e1d5", "#b4c3ac", "#8ea682", "#698859", "#436a2f")
+colors5 = c('#ffffff', '#5E1168', '#962865', '#D24942', '#FFBD43', '#FEF99C')
+ggplot() +
+  geom_sf(data = density.frame, aes(fill = bins), lwd = .1, alpha = 1) +
+  scale_fill_manual(name = 'Counts per Cell',
+                    labels = c('0-1', '2-10', '11-30', '31-80', '81-150',
+                               '151-1000'),
+                    values = colorRampPalette(colors5)(6)) +
+  facet_wrap(~breed) +
+  # geom_sf(data = subset(featuresAll, Description == 'water'),
+  #                       aes(color = Age), size = 2) +
+  # scale_color_manual(name = 'Water Source Age',
+  #                    labels = c('New Water Source', 'Old Water Source'),
+  #                    values = c('#6667AB', '#884C5E')) +
+  theme_classic()
+
+### calculate coefficient of variation ----
+# sample with replacement from cells
+sample.times = 100
+cv.100 = matrix(data = NA, nrow = sample.times, ncol = 2)
+names(cv.100) = c('Criollo', 'Angus')
+
+for(i in seq(1:sample.times)) {
+  subsample_id = sample(x = dim(cell_density100)[1], 
+                        size = dim(cell_density100)[1], 
+                        replace = T)
+  subsample = cell_density100[subsample_id,]
+  
+  # calculate mean and sd
+  c.sub.mean = mean(subsample$criollo.counts)
+  a.sub.mean = mean(subsample$angus.counts)
+  c.sub.sd = sd(subsample$criollo.counts)
+  a.sub.sd = sd(subsample$angus.counts)
+  c.sub.cv = c.sub.sd/c.sub.mean
+  a.sub.cv = a.sub.sd/a.sub.mean
+  sub.cv = c(c.sub.cv, a.sub.cv)
+  
+  # add cv to array
+  cv.100[i,] = sub.cv
+}
+
+```
+
+## CLUSTERING ANALYSIS: 50mx50m grid
+```{r}
+# create 50m grid
+grid50 = st_make_grid(drill_pasture_sf, cellsize = 50)
+grid50_sf = grid50 %>%
+  st_intersection(AOI) %>%
+  st_sf
+
+# calculate criollo and angus density in area
+cell.density.criollo = grid50_sf %>% 
+  mutate(criollo.counts = 
+           lengths(st_intersects(., subset(DP_points_sf, BREED == 'Criollo'))))
+cell.density.angus = grid50_sf %>% 
+  mutate(angus.counts = 
+           lengths(st_intersects(., subset(DP_points_sf, BREED == 'Angus'))))
+cell_density50 = cell.density.criollo %>%
+  mutate(angus.counts = cell.density.angus$angus.counts)
+
+### calculate coefficient of variation ----
+# sample with replacement from cells
+cv.50 = matrix(data = NA, nrow = sample.times, ncol = 2)
+names(cv.50) = c('Criollo', 'Angus')
+
+for(i in seq(1:sample.times)) {
+  subsample_id = sample(x = dim(cell_density50)[1], 
+                        size = dim(cell_density100)[1], 
+                        replace = T)
+  subsample = cell_density50[subsample_id,]
+  
+  # calculate mean and sd
+  c.sub.mean = mean(subsample$criollo.counts)
+  a.sub.mean = mean(subsample$angus.counts)
+  c.sub.sd = sd(subsample$criollo.counts)
+  a.sub.sd = sd(subsample$angus.counts)
+  c.sub.cv = c.sub.sd/c.sub.mean
+  a.sub.cv = a.sub.sd/a.sub.mean
+  sub.cv = c(c.sub.cv, a.sub.cv)
+  
+  # add cv to array
+  cv.50[i,] = sub.cv
+}
+```
+
+## CLUSTERING ANALYSIS: 30x30m grid
+```{r}
+# create 30m grid
+grid30 = st_make_grid(drill_pasture_sf, cellsize = 30)
+grid30_sf = grid30 %>%
+  st_intersection(AOI) %>%
+  st_sf
+
+# calculate criollo and angus density in area
+cell.density.criollo = grid30_sf %>% 
+  mutate(criollo.counts = 
+           lengths(st_intersects(., subset(DP_points_sf, BREED == 'Criollo'))))
+cell.density.angus = grid30_sf %>% 
+  mutate(angus.counts = 
+           lengths(st_intersects(., subset(DP_points_sf, BREED == 'Angus'))))
+cell_density30 = cell.density.criollo %>%
+  mutate(angus.counts = cell.density.angus$angus.counts)
+
+### calculate coefficient of variation ----
+# sample with replacement from cells
+cv.30 = matrix(data = NA, nrow = sample.times, ncol = 2)
+names(cv.30) = c('Criollo', 'Angus')
+
+for(i in seq(1:sample.times)) {
+  subsample_id = sample(x = dim(cell_density30)[1], 
+                        size = dim(cell_density100)[1], 
+                        replace = T)
+  subsample = cell_density30[subsample_id,]
+  
+  # calculate mean and sd
+  c.sub.mean = mean(subsample$criollo.counts)
+  a.sub.mean = mean(subsample$angus.counts)
+  c.sub.sd = sd(subsample$criollo.counts)
+  a.sub.sd = sd(subsample$angus.counts)
+  c.sub.cv = c.sub.sd/c.sub.mean
+  a.sub.cv = a.sub.sd/a.sub.mean
+  sub.cv = c(c.sub.cv, a.sub.cv)
+  
+  # add cv to array
+  cv.30[i,] = sub.cv
+}
+```
+
+## CLUSTERING ANALYSIS: 20mx20m grid
+```{r}
+# create 20m grid
+grid20 = st_make_grid(drill_pasture_sf, cellsize = 20)
+grid20_sf = grid20 %>%
+  st_intersection(AOI) %>%
+  st_sf
+
+# calculate criollo and angus density in area
+cell.density.criollo = grid20_sf %>% 
+  mutate(criollo.counts = 
+           lengths(st_intersects(., subset(DP_points_sf, BREED == 'Criollo'))))
+cell.density.angus = grid20_sf %>% 
+  mutate(angus.counts = 
+           lengths(st_intersects(., subset(DP_points_sf, BREED == 'Angus'))))
+cell_density20 = cell.density.criollo %>%
+  mutate(angus.counts = cell.density.angus$angus.counts)
+
+### calculate coefficient of variation ----
+# sample with replacement from cells
+cv.20 = matrix(data = NA, nrow = sample.times, ncol = 2)
+names(cv.20) = c('Criollo', 'Angus')
+
+for(i in seq(1:sample.times)) {
+  subsample_id = sample(x = dim(cell_density20)[1], 
+                        size = dim(cell_density100)[1], 
+                        replace = T)
+  subsample = cell_density20[subsample_id,]
+  
+  # calculate mean and sd
+  c.sub.mean = mean(subsample$criollo.counts)
+  a.sub.mean = mean(subsample$angus.counts)
+  c.sub.sd = sd(subsample$criollo.counts)
+  a.sub.sd = sd(subsample$angus.counts)
+  c.sub.cv = c.sub.sd/c.sub.mean
+  a.sub.cv = a.sub.sd/a.sub.mean
+  sub.cv = c(c.sub.cv, a.sub.cv)
+  
+  # add cv to array
+  cv.20[i,] = sub.cv
+}
+```
+
+## CLUSTERING ANALYSIS: 10x10m grid
+```{r}
+# create 10m grid
+grid10 = st_make_grid(drill_pasture_sf, cellsize = 10)
+grid10_sf = grid10 %>%
+  st_intersection(AOI) %>%
+  st_sf
+
+# calculate criollo and angus density in area
+cell.density.criollo = grid10_sf %>% 
+  mutate(criollo.counts = 
+           lengths(st_intersects(., subset(DP_points_sf, BREED == 'Criollo'))))
+cell.density.angus = grid10_sf %>% 
+  mutate(angus.counts = 
+           lengths(st_intersects(., subset(DP_points_sf, BREED == 'Angus'))))
+cell_density10 = cell.density.criollo %>%
+  mutate(angus.counts = cell.density.angus$angus.counts)
+
+### calculate coefficient of variation ----
+# sample with replacement from cells
+cv.10 = matrix(data = NA, nrow = sample.times, ncol = 2)
+names(cv.10) = c('Criollo', 'Angus')
+
+for(i in seq(1:sample.times)) {
+  subsample_id = sample(x = dim(cell_density10)[1], 
+                        size = dim(cell_density100)[1], 
+                        replace = T)
+  subsample = cell_density10[subsample_id,]
+  
+  # calculate mean and sd
+  c.sub.mean = mean(subsample$criollo.counts)
+  a.sub.mean = mean(subsample$angus.counts)
+  c.sub.sd = sd(subsample$criollo.counts)
+  a.sub.sd = sd(subsample$angus.counts)
+  c.sub.cv = c.sub.sd/c.sub.mean
+  a.sub.cv = a.sub.sd/a.sub.mean
+  sub.cv = c(c.sub.cv, a.sub.cv)
+  
+  # add cv to array
+  cv.10[i,] = sub.cv
+}
+```
+
+### combine cv matrices into data.frame for plotting
+```{r}
+all.cvs = cv.100 %>%
+  rbind(., cv.50) %>%
+  rbind(., cv.30) %>%
+  rbind(., cv.20) %>%
+  rbind(., cv.10)
+
+all.cvs = as.data.frame(all.cvs)
+
+names(all.cvs) = c('Criollo', 'Angus')
+
+### add spatial scale column
+all.cvs$scale = rep(c(100*100, 50*50, 30*30, 20*20, 10*10), each = sample.times)
+
+### restructure data.frame
+all.cvs = all.cvs %>% 
+  pivot_longer(cols = 1:2, names_to = 'breed', values_to = 'cv')
+
+### calculate means and CIs
+mean.cvs = tapply(all.cvs$cv, INDEX = list(all.cvs$breed, all.cvs$scale), FUN = mean)
+sd.cvs = tapply(all.cvs$cv, INDEX = list(all.cvs$breed, all.cvs$scale), FUN = sd)
+
+t.score = qt(p = 0.95, df = sample.times-1)
+margin.error = (t.score * sd.cvs) / sqrt(sample.times)
+margin.error = as.data.frame(margin.error) %>%
+  pivot_longer(cols = 1:5, names_to = 'scale', 
+                            values_to = 'CI')
+
+### create data frame for plotting
+cv.df = mean.cvs %>%
+  as.data.frame() %>%
+  pivot_longer(cols = 1:5, names_to = 'scale', values_to = 'mean.cv')
+cv.df$scale = as.integer(cv.df$scale)
+cv.df$breed = rep(c('Angus', 'Criollo'), each = 5)
+cv.df$margin.error = margin.error$CI
+  
+### plot results
+ggplot() +
+  geom_boxplot(data = all.cvs, aes(x = as.factor(scale), y = cv, color = breed),
+               notch = T) + 
+  xlab('Grid Size (m^2)') +
+  ylab('Coefficient of Variation')
+
+ggplot() +
+  geom_point(data = cv.df, aes(x = log10(scale), y = mean.cv, color = breed),
+             cex = 3) +
+  geom_errorbar(data = cv.df, aes(x = log10(scale), 
+                                  ymin = mean.cv - margin.error,
+                                  ymax = mean.cv + margin.error, 
+                                  color = breed),
+                lwd = 2) +
+  scale_color_manual(name = 'Breed', values = c('#A1CAC9', '#759F51')) +
+  xlab('log(Grid Cell Size (m^2))') +
+  ylab('Coefficient of Variation') +
+  theme_classic(base_size = 22)
+
+ggplot() +
+  geom_point(data = all.cvs, aes(x = log10(scale), y = cv, color = breed)) +
+  geom_smooth(data = all.cvs, aes(x = log10(scale), y = cv, color = breed),
+              method = lm, level = 0.90) +
+  scale_color_manual(name = 'Breed', values = c('#6667AB', '#A1CAC9')) +
+  xlab('log(Grid Cell Size (m^2))') +
+  ylab('Coefficient of Variation')
+
+```
+
+<!-- ## CLUSTERING ANALYSIS: 100x100m grid for each individual -->
+<!-- (no bootstrapping) -->
+<!-- ```{r} -->
+<!-- # count how many points in each grid cell for each individual -->
+<!-- indiv.counts.100 = list() -->
+
+<!-- for(i in seq(1, dim(breed.info)[1])) { -->
+<!--   tag = breed.info$tag_no[i] -->
+<!--   cell.density = grid_sf %>%  -->
+<!--     mutate(counts = lengths(st_intersects(., subset(DP_points_sf, -->
+<!--                                                  tag_no == tag)))) -->
+<!--   cell.density$tag_no = tag -->
+<!--   indiv.counts.100[[i]] = cell.density -->
+<!-- } -->
+
+<!-- ### calculate coefficient of variation -->
+<!-- # no sample with replacement, calculate mean and sd for all cells for each indiv -->
+
+<!-- # calculate mean and sd -->
+<!-- indiv.mean = lapply(X = indiv.counts.100,  -->
+<!--                     FUN = function(x){ -->
+<!--                       counts = mean(x$counts, na.rm = T) -->
+<!--                       return(counts)}) %>% -->
+<!--   unlist() -->
+<!-- indiv.sd = lapply(X = indiv.counts.100,  -->
+<!--                     FUN = function(x){ -->
+<!--                       counts = sd(x$counts, na.rm = T) -->
+<!--                       return(counts)}) %>% -->
+<!--   unlist() -->
+<!-- indiv.cv.100 = indiv.sd/indiv.mean  -->
+<!-- indiv.cv.100 = indiv.cv.100 %>% -->
+<!--   as.data.frame() %>% -->
+<!--   mutate(tag_no = breed.info$tag_no, breed = breed.info$breed, scale = 100*100) -->
+<!-- names(indiv.cv.100) = c('CV', 'tag_no', 'breed', 'scale') -->
+
+<!-- ``` -->
+
+<!-- ## CLUSTERING ANALYSIS: 50x50m grid for each individual -->
+<!-- (no bootstrapping) -->
+<!-- ```{r} -->
+<!-- # count how many points in each grid cell for each individual -->
+<!-- indiv.counts.50 = list() -->
+
+<!-- for(i in seq(1, dim(breed.info)[1])) { -->
+<!--   tag = breed.info$tag_no[i] -->
+<!--   cell.density = grid50_sf %>%  -->
+<!--     mutate(counts = lengths(st_intersects(., subset(DP_points_sf, -->
+<!--                                                  tag_no == tag)))) -->
+<!--   cell.density$tag_no = tag -->
+<!--   indiv.counts.50[[i]] = cell.density -->
+<!-- } -->
+
+<!-- ### calculate coefficient of variation -->
+<!-- # no sample with replacement, calculate mean and sd for all cells for each indiv -->
+
+<!-- # calculate mean and sd -->
+<!-- indiv.mean = lapply(X = indiv.counts.50,  -->
+<!--                     FUN = function(x){ -->
+<!--                       counts = mean(x$counts, na.rm = T) -->
+<!--                       return(counts)}) %>% -->
+<!--   unlist() -->
+<!-- indiv.sd = lapply(X = indiv.counts.50,  -->
+<!--                     FUN = function(x){ -->
+<!--                       counts = sd(x$counts, na.rm = T) -->
+<!--                       return(counts)}) %>% -->
+<!--   unlist() -->
+<!-- indiv.cv.50 = indiv.sd/indiv.mean  -->
+<!-- indiv.cv.50 = indiv.cv.50 %>% -->
+<!--   as.data.frame() %>% -->
+<!--   mutate(tag_no = breed.info$tag_no, breed = breed.info$breed, scale = 50*50) -->
+<!-- names(indiv.cv.50) = c('CV', 'tag_no', 'breed', 'scale') -->
+
+<!-- ``` -->
+
+<!-- ## CLUSTERING ANALYSIS: 30x30m grid for each individual -->
+<!-- (no bootstrapping) -->
+<!-- ```{r} -->
+<!-- # count how many points in each grid cell for each individual -->
+<!-- indiv.counts.30 = list() -->
+
+<!-- for(i in seq(1, dim(breed.info)[1])) { -->
+<!--   tag = breed.info$tag_no[i] -->
+<!--   cell.density = grid30_sf %>%  -->
+<!--     mutate(counts = lengths(st_intersects(., subset(DP_points_sf, -->
+<!--                                                  tag_no == tag)))) -->
+<!--   cell.density$tag_no = tag -->
+<!--   indiv.counts.30[[i]] = cell.density -->
+<!-- } -->
+
+<!-- ### calculate coefficient of variation -->
+<!-- # no sample with replacement, calculate mean and sd for all cells for each indiv -->
+
+<!-- # calculate mean and sd -->
+<!-- indiv.mean = lapply(X = indiv.counts.30,  -->
+<!--                     FUN = function(x){ -->
+<!--                       counts = mean(x$counts, na.rm = T) -->
+<!--                       return(counts)}) %>% -->
+<!--   unlist() -->
+<!-- indiv.sd = lapply(X = indiv.counts.30,  -->
+<!--                     FUN = function(x){ -->
+<!--                       counts = sd(x$counts, na.rm = T) -->
+<!--                       return(counts)}) %>% -->
+<!--   unlist() -->
+<!-- indiv.cv.30 = indiv.sd/indiv.mean  -->
+<!-- indiv.cv.30 = indiv.cv.30 %>% -->
+<!--   as.data.frame() %>% -->
+<!--   mutate(tag_no = breed.info$tag_no, breed = breed.info$breed, scale = 30*30) -->
+<!-- names(indiv.cv.30) = c('CV', 'tag_no', 'breed', 'scale') -->
+
+<!-- ``` -->
+
+<!-- ## CLUSTERING ANALYSIS: 20x20m grid for each individual -->
+<!-- (no bootstrapping) -->
+<!-- ```{r} -->
+<!-- # count how many points in each grid cell for each individual -->
+<!-- indiv.counts.20 = list() -->
+
+<!-- for(i in seq(1, dim(breed.info)[1])) { -->
+<!--   tag = breed.info$tag_no[i] -->
+<!--   cell.density = grid20_sf %>%  -->
+<!--     mutate(counts = lengths(st_intersects(., subset(DP_points_sf, -->
+<!--                                                  tag_no == tag)))) -->
+<!--   cell.density$tag_no = tag -->
+<!--   indiv.counts.20[[i]] = cell.density -->
+<!-- } -->
+
+<!-- ### calculate coefficient of variation -->
+<!-- # no sample with replacement, calculate mean and sd for all cells for each indiv -->
+
+<!-- # calculate mean and sd -->
+<!-- indiv.mean = lapply(X = indiv.counts.20,  -->
+<!--                     FUN = function(x){ -->
+<!--                       counts = mean(x$counts, na.rm = T) -->
+<!--                       return(counts)}) %>% -->
+<!--   unlist() -->
+<!-- indiv.sd = lapply(X = indiv.counts.20,  -->
+<!--                     FUN = function(x){ -->
+<!--                       counts = sd(x$counts, na.rm = T) -->
+<!--                       return(counts)}) %>% -->
+<!--   unlist() -->
+<!-- indiv.cv.20 = indiv.sd/indiv.mean  -->
+<!-- indiv.cv.20 = indiv.cv.20 %>% -->
+<!--   as.data.frame() %>% -->
+<!--   mutate(tag_no = breed.info$tag_no, breed = breed.info$breed, scale = 20*20) -->
+<!-- names(indiv.cv.20) = c('CV', 'tag_no', 'breed', 'scale') -->
+
+<!-- ``` -->
+
+<!-- ## CLUSTERING ANALYSIS: 10x10m grid for each individual -->
+<!-- (no bootstrapping) -->
+<!-- ```{r} -->
+<!-- # count how many points in each grid cell for each individual -->
+<!-- indiv.counts.10 = list() -->
+
+<!-- for(i in seq(1, dim(breed.info)[1])) { -->
+<!--   tag = breed.info$tag_no[i] -->
+<!--   cell.density = grid10_sf %>%  -->
+<!--     mutate(counts = lengths(st_intersects(., subset(DP_points_sf, -->
+<!--                                                  tag_no == tag)))) -->
+<!--   cell.density$tag_no = tag -->
+<!--   indiv.counts.10[[i]] = cell.density -->
+<!-- } -->
+
+<!-- ### calculate coefficient of variation -->
+<!-- # no sample with replacement, calculate mean and sd for all cells for each indiv -->
+
+<!-- # calculate mean and sd -->
+<!-- indiv.mean = lapply(X = indiv.counts.10,  -->
+<!--                     FUN = function(x){ -->
+<!--                       counts = mean(x$counts, na.rm = T) -->
+<!--                       return(counts)}) %>% -->
+<!--   unlist() -->
+<!-- indiv.sd = lapply(X = indiv.counts.10,  -->
+<!--                     FUN = function(x){ -->
+<!--                       counts = sd(x$counts, na.rm = T) -->
+<!--                       return(counts)}) %>% -->
+<!--   unlist() -->
+<!-- indiv.cv.10 = indiv.sd/indiv.mean  -->
+<!-- indiv.cv.10 = indiv.cv.10 %>% -->
+<!--   as.data.frame() %>% -->
+<!--   mutate(tag_no = breed.info$tag_no, breed = breed.info$breed, scale = 10*10) -->
+<!-- names(indiv.cv.10) = c('CV', 'tag_no', 'breed', 'scale') -->
+
+<!-- ``` -->
+
+<!-- ### combine individual cv into dataframe for plotting -->
+<!-- ```{r} -->
+<!-- indiv.cv = indiv.cv.100 %>% -->
+<!--   rbind(indiv.cv.50) %>% -->
+<!--   rbind(indiv.cv.30) %>% -->
+<!--   rbind(indiv.cv.20) %>% -->
+<!--   rbind(indiv.cv.10) -->
+
+<!-- lm.indiv = nlme::lme(CV ~ scale*breed, random = ~1|tag_no, data = indiv.cv) -->
+<!-- summary(lm.indiv) -->
+
+<!-- ggplot() + -->
+<!--   geom_point(data = indiv.cv, aes(x = log10(scale), y = CV, color = breed),  -->
+<!--              alpha = 0.7) + -->
+<!--   geom_smooth(data = indiv.cv, aes(x = log10(scale), y = CV, color = breed),  -->
+<!--              alpha = 0.7, method = 'lm', level = 0.9) + -->
+<!--   xlab('log(Grid Size (m^2))') + -->
+<!--   ylab('Coefficient of Variation') -->
+
+<!-- ggplot() + -->
+<!--   geom_boxplot(data = indiv.cv,  -->
+<!--                aes(x = as.factor(scale), y = CV, color = breed), -->
+<!--                notch = T) -->
+<!-- ``` -->
+
+<!-- ## CLUSTERING ANALYSIS: 100x100m grid for each day -->
+<!-- (no bootstrapping) -->
+<!-- ```{r} -->
+<!-- days = unique(as.Date(DP_points_sf$t_)) -->
+
+<!-- # count how many points in each grid cell for each individual -->
+<!-- daily.counts.100.list = list() -->
+
+<!-- for(i in seq(1, length(days))) { -->
+<!--   current.date = days[i] -->
+<!--   criollo.density = grid_sf %>%  -->
+<!--     mutate(counts = lengths(st_intersects(., subset(DP_points_sf, -->
+<!--                                                     BREED == 'Criollo' & -->
+<!--                                                       as.Date(t_) == current.date))), -->
+<!--            breed = 'Criollo', date = current.date) -->
+<!--   angus.density = grid_sf %>%  -->
+<!--     mutate(counts = lengths(st_intersects(., subset(DP_points_sf, -->
+<!--                                                     BREED == 'Angus' & -->
+<!--                                                       as.Date(t_) == current.date))), -->
+<!--            breed = 'Angus', date = current.date) -->
+<!--   cell.density = rbind(criollo.density, angus.density) -->
+<!--   daily.counts.100.list[[i]] = cell.density -->
+<!-- } -->
+
+<!-- ### calculate coefficient of variation -->
+<!-- # no sample with replacement -->
+<!-- # create data.frame from list -->
+<!-- daily.counts.100 = bind_rows(daily.counts.100.list) -->
+
+<!-- # calculate mean and sd for all cells for each day for each breed -->
+<!-- daily.mean = tapply(X = daily.counts.100$counts,  -->
+<!--                     INDEX = list(daily.counts.100$date, daily.counts.100$breed), -->
+<!--                     FUN = mean) -->
+<!-- daily.sd = tapply(X = daily.counts.100$counts,  -->
+<!--                     INDEX = list(daily.counts.100$date, daily.counts.100$breed), -->
+<!--                     FUN = sd) -->
+<!-- daily.cv.100 = daily.sd/daily.mean  -->
+<!-- daily.cv.100 = daily.cv.100 %>% -->
+<!--   as.data.frame() %>% -->
+<!--   pivot_longer(cols = 1:2, names_to = 'breed', values_to = 'CV') %>% -->
+<!--   mutate(date = rep(days, each = 2), scale = 100*100) -->
+
+<!-- ``` -->
+
+<!-- ## CLUSTERING ANALYSIS: 50x50m grid for each day -->
+<!-- (no bootstrapping) -->
+<!-- ```{r} -->
+<!-- # count how many points in each grid cell for each individual -->
+<!-- daily.counts.50.list = list() -->
+
+<!-- for(i in seq(1, length(days))) { -->
+<!--   current.date = days[i] -->
+<!--   criollo.density = grid50_sf %>%  -->
+<!--     mutate(counts = lengths(st_intersects(., subset(DP_points_sf, -->
+<!--                                                     BREED == 'Criollo' & -->
+<!--                                                       as.Date(t_) == current.date))), -->
+<!--            breed = 'Criollo', date = current.date) -->
+<!--   angus.density = grid50_sf %>%  -->
+<!--     mutate(counts = lengths(st_intersects(., subset(DP_points_sf, -->
+<!--                                                     BREED == 'Angus' & -->
+<!--                                                       as.Date(t_) == current.date))), -->
+<!--            breed = 'Angus', date = current.date) -->
+<!--   cell.density = rbind(criollo.density, angus.density) -->
+<!--   daily.counts.50.list[[i]] = cell.density -->
+<!-- } -->
+
+<!-- ### calculate coefficient of variation -->
+<!-- # no sample with replacement -->
+<!-- # create data.frame from list -->
+<!-- daily.counts.50 = bind_rows(daily.counts.50.list) -->
+
+<!-- # calculate mean and sd for all cells for each day for each breed -->
+<!-- daily.mean = tapply(X = daily.counts.50$counts,  -->
+<!--                     INDEX = list(daily.counts.50$date, daily.counts.50$breed), -->
+<!--                     FUN = mean) -->
+<!-- daily.sd = tapply(X = daily.counts.50$counts,  -->
+<!--                     INDEX = list(daily.counts.50$date, daily.counts.50$breed), -->
+<!--                     FUN = sd) -->
+<!-- daily.cv.50 = daily.sd/daily.mean  -->
+<!-- daily.cv.50 = daily.cv.50 %>% -->
+<!--   as.data.frame() %>% -->
+<!--   pivot_longer(cols = 1:2, names_to = 'breed', values_to = 'CV') %>% -->
+<!--   mutate(date = rep(days, each = 2), scale = 50*50) -->
+<!-- ``` -->
+
+<!-- ## CLUSTERING ANALYSIS: 30x30m grid for each day -->
+<!-- (no bootstrapping) -->
+<!-- ```{r} -->
+<!-- # count how many points in each grid cell for each individual -->
+<!-- daily.counts.30.list = list() -->
+
+<!-- for(i in seq(1, length(days))) { -->
+<!--   current.date = days[i] -->
+<!--   criollo.density = grid30_sf %>%  -->
+<!--     mutate(counts = lengths(st_intersects(., subset(DP_points_sf, -->
+<!--                                                     BREED == 'Criollo' & -->
+<!--                                                       as.Date(t_) == current.date))), -->
+<!--            breed = 'Criollo', date = current.date) -->
+<!--   angus.density = grid30_sf %>%  -->
+<!--     mutate(counts = lengths(st_intersects(., subset(DP_points_sf, -->
+<!--                                                     BREED == 'Angus' & -->
+<!--                                                       as.Date(t_) == current.date))), -->
+<!--            breed = 'Angus', date = current.date) -->
+<!--   cell.density = rbind(criollo.density, angus.density) -->
+<!--   daily.counts.30.list[[i]] = cell.density -->
+<!-- } -->
+
+<!-- ### calculate coefficient of variation -->
+<!-- # no sample with replacement -->
+<!-- # create data.frame from list -->
+<!-- daily.counts.30 = bind_rows(daily.counts.30.list) -->
+
+<!-- # calculate mean and sd for all cells for each day for each breed -->
+<!-- daily.mean = tapply(X = daily.counts.30$counts,  -->
+<!--                     INDEX = list(daily.counts.30$date, daily.counts.30$breed), -->
+<!--                     FUN = mean) -->
+<!-- daily.sd = tapply(X = daily.counts.30$counts,  -->
+<!--                     INDEX = list(daily.counts.30$date, daily.counts.30$breed), -->
+<!--                     FUN = sd) -->
+<!-- daily.cv.30 = daily.sd/daily.mean  -->
+<!-- daily.cv.30 = daily.cv.30 %>% -->
+<!--   as.data.frame() %>% -->
+<!--   pivot_longer(cols = 1:2, names_to = 'breed', values_to = 'CV') %>% -->
+<!--   mutate(date = rep(days, each = 2), scale = 30*30) -->
+<!-- ``` -->
+
+<!-- ## CLUSTERING ANALYSIS: 20x20m grid for each day -->
+<!-- (no bootstrapping) -->
+<!-- ```{r} -->
+<!-- # count how many points in each grid cell for each individual -->
+<!-- daily.counts.20.list = list() -->
+
+<!-- for(i in seq(1, length(days))) { -->
+<!--   current.date = days[i] -->
+<!--   criollo.density = grid20_sf %>%  -->
+<!--     mutate(counts = lengths(st_intersects(., subset(DP_points_sf, -->
+<!--                                                     BREED == 'Criollo' & -->
+<!--                                                       as.Date(t_) == current.date))), -->
+<!--            breed = 'Criollo', date = current.date) -->
+<!--   angus.density = grid20_sf %>%  -->
+<!--     mutate(counts = lengths(st_intersects(., subset(DP_points_sf, -->
+<!--                                                     BREED == 'Angus' & -->
+<!--                                                       as.Date(t_) == current.date))), -->
+<!--            breed = 'Angus', date = current.date) -->
+<!--   cell.density = rbind(criollo.density, angus.density) -->
+<!--   daily.counts.20.list[[i]] = cell.density -->
+<!-- } -->
+
+<!-- ### calculate coefficient of variation -->
+<!-- # no sample with replacement -->
+<!-- # create data.frame from list -->
+<!-- daily.counts.20 = bind_rows(daily.counts.20.list) -->
+
+<!-- # calculate mean and sd for all cells for each day for each breed -->
+<!-- daily.mean = tapply(X = daily.counts.20$counts,  -->
+<!--                     INDEX = list(daily.counts.20$date, daily.counts.20$breed), -->
+<!--                     FUN = mean) -->
+<!-- daily.sd = tapply(X = daily.counts.20$counts,  -->
+<!--                     INDEX = list(daily.counts.20$date, daily.counts.20$breed), -->
+<!--                     FUN = sd) -->
+<!-- daily.cv.20 = daily.sd/daily.mean  -->
+<!-- daily.cv.20 = daily.cv.20 %>% -->
+<!--   as.data.frame() %>% -->
+<!--   pivot_longer(cols = 1:2, names_to = 'breed', values_to = 'CV') %>% -->
+<!--   mutate(date = rep(days, each = 2), scale = 20*20) -->
+<!-- ``` -->
+
+<!-- ## CLUSTERING ANALYSIS: 10x10m grid for each day -->
+<!-- (no bootstrapping) -->
+<!-- ```{r} -->
+<!-- # count how many points in each grid cell for each individual -->
+<!-- daily.counts.10.list = list() -->
+
+<!-- for(i in seq(1, length(days))) { -->
+<!--   current.date = days[i] -->
+<!--   criollo.density = grid10_sf %>%  -->
+<!--     mutate(counts = lengths(st_intersects(., subset(DP_points_sf, -->
+<!--                                                     BREED == 'Criollo' & -->
+<!--                                                       as.Date(t_) == current.date))), -->
+<!--            breed = 'Criollo', date = current.date) -->
+<!--   angus.density = grid10_sf %>%  -->
+<!--     mutate(counts = lengths(st_intersects(., subset(DP_points_sf, -->
+<!--                                                     BREED == 'Angus' & -->
+<!--                                                       as.Date(t_) == current.date))), -->
+<!--            breed = 'Angus', date = current.date) -->
+<!--   cell.density = rbind(criollo.density, angus.density) -->
+<!--   daily.counts.10.list[[i]] = cell.density -->
+<!-- } -->
+
+<!-- ### calculate coefficient of variation -->
+<!-- # no sample with replacement -->
+<!-- # create data.frame from list -->
+<!-- daily.counts.10 = bind_rows(daily.counts.10.list) -->
+
+<!-- # calculate mean and sd for all cells for each day for each breed -->
+<!-- daily.mean = tapply(X = daily.counts.10$counts,  -->
+<!--                     INDEX = list(daily.counts.10$date, daily.counts.10$breed), -->
+<!--                     FUN = mean) -->
+<!-- daily.sd = tapply(X = daily.counts.10$counts,  -->
+<!--                     INDEX = list(daily.counts.10$date, daily.counts.10$breed), -->
+<!--                     FUN = sd) -->
+<!-- daily.cv.10 = daily.sd/daily.mean  -->
+<!-- daily.cv.10 = daily.cv.10 %>% -->
+<!--   as.data.frame() %>% -->
+<!--   pivot_longer(cols = 1:2, names_to = 'breed', values_to = 'CV') %>% -->
+<!--   mutate(date = rep(days, each = 2), scale = 10*10) -->
+<!-- ``` -->
+
+<!-- ### combine day cv into dataframe for plotting -->
+<!-- ```{r} -->
+<!-- daily.cv = daily.cv.100 %>% -->
+<!--   rbind(daily.cv.50) %>% -->
+<!--   rbind(daily.cv.30) %>% -->
+<!--   rbind(daily.cv.20) %>% -->
+<!--   rbind(daily.cv.10) %>% -->
+<!--   filter(!is.na(CV)) -->
+
+<!-- daily.cv = daily.cv %>% -->
+<!--   filter(date >= as.Date(entry) & date <= as.Date(exit)) -->
+
+<!-- lm.daily = nlme::lme(CV ~ scale*breed, random = ~1|date, data = daily.cv) -->
+<!-- summary(lm.daily) -->
+
+<!-- ggplot() + -->
+<!--   geom_point(data = daily.cv, aes(x = log10(scale), y = CV, color = breed),  -->
+<!--              alpha = 0.7) + -->
+<!--   geom_smooth(data = daily.cv, aes(x = log10(scale), y = CV, color = breed),  -->
+<!--              alpha = 0.7, method = 'lm', level = 0.9) + -->
+<!--   xlab('log(Grid Size (m^2))') + -->
+<!--   ylab('Coefficient of Variation') -->
+
+<!-- ggplot() + -->
+<!--   geom_boxplot(data = daily.cv,  -->
+<!--                aes(x = as.factor(scale), y = CV, color = breed), -->
+<!--                notch = T) -->
+<!-- ``` -->

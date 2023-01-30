@@ -1,0 +1,158 @@
+---
+title: "Code to Organize Collar Data"
+author: "Maria Stahl"
+date: "11/9/2021"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+rm(list = ls())
+
+library(amt)
+library(ggplot2)
+library(hms)
+library(lubridate)
+library(raster)
+library(rgdal)
+library(rlist)
+library(sf)
+library(tidyverse)
+library(tmap)
+library(data.table)
+```
+
+### Read in csv files
+```{r}
+filenames = array(c('PinPoint 80332 2021-11-08 18-56-40.csv',
+              'PinPoint 80333 2021-11-08 19-23-31.csv',
+              'PinPoint 80335 2021-11-08 19-06-16.csv',
+              'PinPoint 80338 2021-11-08 16-29-52.csv',
+              'PinPoint 80341 2021-11-08 19-30-04.csv',
+              'PinPoint 80342 2021-11-08 19-01-04.csv',
+              'PinPoint 80343 2021-11-08 19-27-04.csv',
+              'PinPoint 80344 2021-11-08 19-09-02.csv',
+              'PinPoint 80345 2021-11-08 19-11-48.csv',
+              'PinPoint 80346 2021-11-08 19-18-14.csv',
+              'PinPoint 80348 2021-11-08 19-14-23.csv',
+              'PinPoint 80351 2021-11-08 16-18-17.csv'))
+collar.dat = apply(X = filenames, MARGIN = 1, FUN = read.csv,
+                   skip = 3, header = T)
+collar.metadat = read.csv('Dugout Collar Metadata Nov 2021.csv')
+```
+
+### Organize data into master data.frame and clean
+```{r}
+# unlist data
+unlistedCD = rbindlist(collar.dat)
+
+# add in collar numbers
+collars = c(80332, 80333, 80335, 80338, 80341, 80342, 80343, 80344, 80345,
+            80346, 80348, 80351)
+dim = lapply(collar.dat, dim) %>%
+  lapply('[[', 1) %>%
+  unlist()
+unlistedCD$Collar = mapply(rep, collars, dim) %>% unlist()
+
+# remove fixes with <4 satellites
+cleanCD = unlistedCD %>%
+  filter(Satellites > 3 & DOP <= 20)
+
+# add breeds to master data.frame
+breedCollarPairs = collar.metadat %>% 
+  select(Breed, SN)
+names(breedCollarPairs) = c('Breed', 'Collar')
+cleanCD = merge(cleanCD, breedCollarPairs, by = 'Collar')
+cleanCD = distinct(cleanCD)
+```
+
+### write to new csv file
+```{r}
+write.csv(cleanCD, 'GPS Combined May-Nov 2021.csv')
+```
+
+### explore data, look for anomalies
+```{r}
+# read in pasture boundaries
+pasture_boundaries =
+  readOGR('../USU_study_winter_pastures_dissolve/USU_study_winter_pastures_dissolve.shp')
+winter_boundaries_sf = st_as_sf(pasture_boundaries)
+summerBoundaries1 = 
+  readOGR('../Cottonwood_Allotment_and_pasture_boundaries/Cottonwood_Allotment_and_pasture_boundaries.shp')
+summerBoundaries2 = readOGR('../Cottonwood_Allotment_and_pasture_boundaries/BLM_IndianCreekAllotment.shp')
+summerBoundariesAll = raster::union(summerBoundaries1, summerBoundaries2)
+boundaries_sf = st_as_sf(summerBoundariesAll)
+
+# project collar data to UTM
+collar.dat.latlong = st_as_sf(cleanCD, coords = c('Longitude', 'Latitude'))
+st_crs(collar.dat.latlong) = CRS("+proj=longlat +ellps=WGS84")
+collar.dat.latlong$geometry = st_transform(collar.dat.latlong$geometry, 
+                                       crs = st_crs(pasture_boundaries))
+collar.dat.utm = as_Spatial(collar.dat.latlong)
+rm(collar.dat.latlong)
+
+# make some maps
+tm_shape(summerBoundariesAll) + tm_borders() +
+  tm_shape(collar.dat.utm) + tm_dots()
+```
+
+### remove points where individual moved faster than possible
+```{r}
+# convert character to time
+collar.dat.utm@data[['Time']] =
+  as.POSIXct(collar.dat.utm@data[['GMT.Time']],
+             format = '%m/%d/%Y %I:%M:%S %p', tz = 'GMT')
+
+# create track for individuals
+collar.dat.frame = as.data.frame(collar.dat.utm)
+collar.dat.frame = collar.dat.frame[!is.na(collar.dat.frame$Time),]
+collar.dat.frame$Collar = as.factor(collar.dat.frame$Collar)
+collar.dat.list = split(collar.dat.frame, f = collar.dat.frame$Collar)
+cattleTrack = lapply(collar.dat.list, FUN = mk_track, 
+                     .x = coords.x1, .y = coords.x2,
+                     .t = Time, crs = crs(collar.dat.utm), 
+                     order_by_ts = T)
+rm(collar.dat.list)
+
+# calculate velocity from track
+cattleSpeed = lapply(cattleTrack, FUN = speed)
+for(i in seq(1:length(collars))){
+  cattleTrack[[i]][4] = cattleSpeed[[i]]
+  names(cattleTrack[[i]])[4] = 'speed'
+}
+
+# convert list back into data.frame
+cattleSpeed.frame = list.rbind(cattleTrack)
+temp = array()
+for(i in seq(1:length(collars))){
+  temp = append(temp, rep(collars[i], times = dim(cattleTrack[[i]])[1]))
+}
+temp = temp[!is.na(temp)]
+cattleSpeed.frame$Collar = temp
+names(cattleSpeed.frame)[3] = 'Time'
+
+# merge DPcattle.frame and DPspeed.frame
+collar.dat.frame = merge(collar.dat.frame, cattleSpeed.frame, 
+                       by = c('Collar','Time'))
+
+# isolate points from Moab
+weird.points = collar.dat.frame[collar.dat.frame$y_ > 4260000,]
+
+# examine speed data 
+speed.cutoff = stats::quantile(collar.dat.frame$speed, na.rm = T, .95)
+collar.dat.cropped = collar.dat.frame %>%
+  filter(speed < speed.cutoff & Time > max(weird.points$Time))
+
+ggplot() +
+  geom_sf(data = boundaries_sf) +
+  geom_point(data = as.data.frame(collar.dat.cropped), 
+             aes(x = x_, y = y_, color = Collar),
+             alpha = 0.2, size = 0.1) +
+  coord_sf(datum = sf::st_crs(summerBoundariesAll))
+
+```
+
+
+
+
+

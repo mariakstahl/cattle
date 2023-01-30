@@ -1,0 +1,1613 @@
+---
+title: "Drill Pasture"
+author: "Maria Stahl"
+date: "7/10/2021"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+rm(list = ls())
+```
+
+```{r}
+library(amt)
+library(dplyr)
+library(elevdl)
+library(ggplot2)
+library(ggpubr)
+library(glmnetUtils)
+library(grDevices)
+library(gridExtra)
+library(hms)
+library(lemon)
+library(lubridate)
+library(mapview)
+library(permutations)
+library(plyr)
+library(raster)
+library(rasterVis)
+library(rgdal)
+library(rgeos)
+library(rlist)
+library(scales)
+library(sf)
+library(shiny)
+library(shinyjs)
+library(sp)
+library(tidyr)
+library(tmap)
+library(tmaptools)
+library(viridis)
+```
+
+## Load in Drill Pasture shapefile
+```{r}
+drill_pasture = readOGR("Drill_Pasture/Drill_Pasture.shp")
+drill_pasture_sf = st_as_sf(drill_pasture)
+
+```
+
+## Calculate ruggedness (elevation data from https://www.sciencebase.gov/catalog/item/5f7784be82ce1d74e7d6ca12)
+```{r}
+
+elev2 = raster('USGS_13_n39w110.tif')
+dpNAD83 = spTransform(drill_pasture, crs(elev2))
+# check overlap
+# tm_shape(elev2) + tm_raster() +
+#  tm_shape(dpNAD83) + tm_borders()
+elev2 = crop(elev2, dpNAD83@bbox)
+elev2 = projectRaster(elev2, crs = crs(drill_pasture))
+projection(elev2) == projection(drill_pasture)
+names(elev2) = 'drill_elev'
+
+# calculate slope
+ruggedness = terrain(elev2, opt = 'TRI', neighbors = 8)
+slope = terrain(elev2, opt = 'slope', neighbors = 8)
+```
+
+## remove areas with top 4% of elevation and slope
+```{r}
+# limit available points to below threshold elevation and slope
+drill.elev = mask(elev2, drill_pasture)
+drill.slope = mask(slope, drill_pasture)
+elev.bounded = calc(drill.elev, 
+                    fun = function(x){
+                      x[x > quantile(drill.elev, c(.96))] = NA; return(x)})
+slope.bounded = calc(drill.slope, 
+                     fun = function(x){
+                       x[x > quantile(drill.slope, c(.96))] = NA; return(x)})
+elev.bounded = mask(elev.bounded, slope.bounded)
+slope.bounded = mask(slope.bounded, elev.bounded)
+```
+
+## Load in RAP data (raster created through Google Earth Engine)
+```{r}
+veg.dat.2020.small = stack('RAP_VegCover_2020_new.tif')
+
+# reproject RAP data to UTM
+veg.dat.2020.small = 
+  projectRaster(veg.dat.2020.small, crs = crs(drill_pasture))
+veg.dat.2020.small$herb = sum(veg.dat.2020.small$AFGC, 
+                              veg.dat.2020.small$PFGC)
+
+# mask full raster stack to cover only Drill Pasture
+DPveg = mask(veg.dat.2020.small, drill_pasture)
+
+```
+
+## Read in collar data
+```{r}
+cattle.dat.new = read.csv('GPS Combined 2020-21 Winter.csv')
+cattle.dat.new = distinct(cattle.dat.new)
+
+# check how many individuals are in dataset
+levels(as.factor(cattle.dat.new$COLLAR))
+
+# data in UTM
+cattle.gps.new = st_as_sf(cattle.dat.new, coords = c('LONGITUDE', 'LATITUDE'))
+st_crs(cattle.gps.new) = CRS("+proj=longlat +ellps=WGS84")
+cattle.gps.new$geometry = st_transform(cattle.gps.new$geometry, 
+                         crs = st_crs(veg.dat.2020.small))
+
+projection(cattle.gps.new) == projection(veg.dat.2020.small)
+
+cattle.utm.new = as_Spatial(cattle.gps.new)
+
+# remove data points outside of Drill Pasture
+DPcattle.dat.new = cattle.utm.new[!is.na(over(cattle.utm.new,
+                                              as(drill_pasture,
+                                                 'SpatialPolygons'))),]
+
+rm(cattle.gps.new)
+```
+
+## Calculate distance from water and salt licks
+```{r}
+# read in KMZ file and convert to UTM
+features = read_sf('Drill 2020 water and salt.kml')
+features$Name = c('trough1', 'trough2', 'trough3', 'trough4', 'trough5',
+                  'salt_lick1', 'salt1', 'salt2', 'salt3', 'salt_lick4', 
+                  'creek_trough')
+features$Description = c('water', 'water', 'water', 'water', 'water', 'salt',
+                         'salt', 'salt', 'salt', 'salt', 'outside')
+features$geometry = st_transform(features$geometry, crs = crs(drill_pasture_sf))
+
+indianCreek = read_sf('indian creek.kml')
+indianCreek = st_transform(indianCreek, crs = crs(drill_pasture))
+
+# calculate distances
+distances = st_distance(st_as_sf(DPcattle.dat.new), st_as_sf(features))
+
+# create distance raster
+raster.template = elev.bounded
+raster.template = rasterToPoints(raster.template)
+raster.template = raster.template[,-3]
+raster.template = SpatialPoints(raster.template)
+crs(raster.template) = crs(elev.bounded)
+distances2 = st_distance(st_as_sf(raster.template), st_as_sf(features))
+distancesToCreek = st_distance(st_as_sf(raster.template), indianCreek)
+distances2 = cbind(distances2, distancesToCreek)
+
+# calculate shortest distance to water and salt and add to water and salt df
+water = data.frame(raster.template)
+water$close_water = apply(distances2[,c(1:5,12)], FUN = min, MARGIN = 1)
+salt = data.frame(raster.template)
+salt$close_salt = apply(distances2[,6:10], FUN = min, MARGIN = 1)
+
+# convert water and salt into rasters
+water = rasterFromXYZ(water, crs = crs(elev.bounded))
+salt = rasterFromXYZ(salt, crs = crs(elev.bounded))
+log.water = log(water + 1)
+names(log.water) = 'log.water'
+log.salt = log(salt + 1)
+names(log.salt) = 'log.salt'
+
+rm(distances)
+rm(distances2)
+```
+
+## Resample and scale all covariates
+```{r}
+elev.small = resample(elev.bounded, DPveg$herb, method = 'ngb')
+slope.small = resample(slope.bounded, DPveg$herb, method = 'ngb')
+ruggedness.small = resample(ruggedness, DPveg$herb, method = 'ngb')
+water.small = resample(log.water, DPveg$herb, method = 'ngb')
+salt.small = resample(log.salt, DPveg$herb, method = 'ngb')
+herb.small = mask(DPveg$herb, elev.small)
+SHR.small = mask(DPveg$SHR, elev.small)
+TREE.small = mask(DPveg$TREE, elev.small)
+
+scaled.elev = scale(elev.small, center = T)
+scaled.slope = scale(slope.small, center = T)
+scaled.ruggedness = scale(ruggedness.small, center = T)
+names(scaled.elev) = 'drill_elev'
+names(scaled.slope) = 'slope'
+scaled.water = scale(water.small, center = T)
+scaled.salt = scale(salt.small, center = T)
+names(scaled.water) = 'log_water'
+names(scaled.salt) = 'log_salt'
+scaled.herb = scale(herb.small, center = T)
+scaled.SHR = scale(SHR.small, center = T)
+scaled.TREE = scale(TREE.small, center = T) 
+
+```
+
+## Read in Kari's GPX data (for ground truthing RAP)
+```{r}
+# KARI'S WAYPOINTS
+waypoints = read_GPX('Waypoints_04-JUN-21.gpx',
+  layers = c("waypoints"),
+  remove.empty.layers = TRUE,
+  as.sf = TRUE)[[1]]
+
+# MIKE'S GEODATABASE
+gdb = st_read('Mike Field Notes.gdb')
+
+GPX_map = tm_shape(DPveg$herb) + tm_raster() +
+  # tm_shape(features[1:10,]) + 
+  #   tm_dots(col = 'Description', palette = get_brewer_pal('Set1', n = 2),
+  #           size = 0.5) +
+  #   tm_text('Description', size = 0.7, just = 'left', xmod = 0.25) +
+  tm_shape(waypoints) + 
+    tm_dots(size = 0.5, alpha = 0.7, col = get_brewer_pal('Set1', n = 4)[4]) +
+  tm_text('name', size = 0.7, just = 'left', xmod = 0.25) +
+  tm_layout(legend.outside = T, legend.title.size = 2, 
+            legend.text.size = 1.5)
+GPX_map
+
+```
+
+## CLEAN UP DPcattle.dat
+```{r}
+DPcattle.dat.new@data[['date_time']] =
+  as.POSIXct(DPcattle.dat.new@data[['GMT_TIME']],
+           format = '%Y-%m-%d %H:%M:%S', tz = 'GMT')
+DPcattle.dat.new@data[['date_time']] =
+  with_tz(DPcattle.dat.new@data[['date_time']], tz = 'US/Mountain')
+```
+
+## CALCULATE ACTIVITY BUDGETS
+```{r}
+# create track for individuals
+DPcattle.frame = as.data.frame(DPcattle.dat.new)
+DPcattle.frame = DPcattle.frame[!is.na(DPcattle.frame$date_time),]
+DPcattle.frame$COLLAR = as.factor(DPcattle.frame$COLLAR)
+DPcattle.list = split(DPcattle.frame, f = DPcattle.frame$COLLAR)
+DPtrack = lapply(DPcattle.list, FUN = mk_track, .x = coords.x1, .y = coords.x2,
+                 .t = date_time, crs = crs(DPcattle.dat.new), order_by_ts = T,
+                 check_duplicates = T)
+DPtrack = DPtrack[-8]
+rm(DPcattle.list)
+
+breeds = t(array(distinct(DPcattle.frame[,c(1,5)])[2]))
+
+# calculate velocity from track
+collars = levels(as.factor(DPcattle.dat.new$COLLAR))[-8]
+DPspeed = lapply(DPtrack, FUN = speed)
+for(i in seq(1:length(collars))){
+  c = collars[i]
+  DPtrack[[c]][4] = DPspeed[[c]]
+  names(DPtrack[[c]])[4] = 'speed'
+}
+
+# convert list back into data.frame
+DPspeed.frame = list.rbind(DPtrack)
+temp = array()
+for(i in seq(1:length(collars))){
+  temp = append(temp, rep(collars[i], times = dim(DPtrack[[i]])[1]))
+}
+temp = temp[!is.na(temp)]
+DPspeed.frame$COLLAR = temp
+names(DPspeed.frame)[3] = 'date_time'
+rm(DPtrack)
+
+# merge DPcattle.frame and DPspeed.frame
+DPcattle.frame = merge(DPcattle.frame, DPspeed.frame, 
+                       by = c('COLLAR','date_time'))[-c(15,16),]
+
+# classify activity based on speed (from Nyamuryekung'e et al. 2021a)
+resting = 2.34/60 # max resting speed in m/s
+grazing = 25/60 # max grazing speed in m/s
+DPcattle.frame$activity = array()
+DPcattle.frame$activity[DPcattle.frame$speed <= resting] = 'resting'
+DPcattle.frame$activity[DPcattle.frame$speed > resting &
+                          DPcattle.frame$speed <= grazing] = 'grazing'
+DPcattle.frame$activity[DPcattle.frame$speed > grazing] = 'traveling'
+DPcattle.frame$time = as_hms(DPcattle.frame$date_time)
+
+# # How many fixes per individual per day?
+# DPcattle.frame$DATE = as.Date(DPcattle.frame$date_time)
+# DPcattle.frame[DPcattle.frame$DATE < '2021-04-01',]$DATE = NA
+# ggplot(DPcattle.frame) +
+#   geom_bar(aes(x = DATE), stat = 'count') +
+#   facet_wrap(~as.factor(COLLAR), scales = 'free_y')
+
+# ggsave('FixesPerCowPerDay.png', plot = last_plot())
+
+DPcattle.track = mk_track(DPcattle.frame, .x = coords.x1, .y = coords.x2, 
+                          .t = date_time, COLLAR = COLLAR, BREED = BREED, 
+                          ALTITUDE = ALTITUDE,
+                          TEMPERATURE = TEMPERATURE, DOP = DOP,
+                          SATELLITES = SATELLITES, speed = speed, 
+                          activity = activity, time = time, date = date_time)
+
+```
+
+## Prpare all data for model selection
+```{r}
+# create grid of available points
+avail = as.data.frame(scaled.elev, xy = T)
+avail$case_ = rep(0, dim(avail)[1])
+avail = avail[,-3]
+names(avail) = c('x_', 'y_', 'case_')
+avail.small = avail[seq(1,dim(avail)[1],100),] # select every 100th pt
+
+# remove points from first and last three days
+entry = sort(DPcattle.track$date, na.rm = T)[7]
+exit = max(DPcattle.track$date, na.rm = T)
+DPcattle.track.cropped = DPcattle.track %>%
+  filter(date > (entry + 3) & date < (exit - 3))
+DPcattle.frame.cropped = as.data.frame(DPcattle.track.cropped)
+
+# create separate datasets for each activity level for each invididual
+all.list = split(x = DPcattle.track.cropped, 
+                 f = as.factor(DPcattle.track.cropped$COLLAR))[-8]
+all.list = lapply(all.list, `[`, c(1,2))
+rest.track = subset(DPcattle.track.cropped, activity == 'resting')
+rest.list = split(x = rest.track, f = as.factor(rest.track$COLLAR))[-8]
+rest.list = lapply(rest.list, `[`, c(1,2))
+graz.track = subset(DPcattle.track.cropped, activity == 'grazing')
+graz.list = split(x = graz.track, f = as.factor(graz.track$COLLAR))[-8]
+graz.list = lapply(graz.list, `[`, c(1,2))
+mov.track = subset(DPcattle.track.cropped, activity == 'traveling')
+```
+
+## ALL COEFFICIENTS!! LASSO MODEL SELECTION
+```{r}
+HSFmodel = function(used, avail) {
+  used$case_ = 1
+  avail$case_ = 0
+  all.points = rbind(used, avail)
+  all.points = all.points  %>%
+    #attach env covariates to observed and available pts
+    extract_covariates(scaled.elev) %>%
+    extract_covariates(scaled.slope) %>%
+    extract_covariates(scaled.ruggedness) %>%
+    extract_covariates(scaled.water) %>%
+    extract_covariates(scaled.salt) %>%
+    mutate(w = ifelse(case_, 1, 1e3))
+  # create training and testing dataset
+  model = glmnetUtils::cv.glmnet(case_ ~ drill_elev + slope + tri +
+                                   log_water + log_salt,
+              data = all.points, weights = w,
+                   family = binomial(link = 'logit'))
+  return(model)
+}
+
+rest.model.list8 = lapply(X = rest.list, FUN = HSFmodel, avail = avail)
+graz.model.list8 = lapply(X = graz.list, FUN = HSFmodel, avail = avail)
+all.model.list8 = lapply(X = all.list, FUN = HSFmodel, avail = avail)
+
+cf.all = cbind(
+  as.array(coef(all.model.list8[[1]])), as.array(coef(all.model.list8[[2]])),
+  as.array(coef(all.model.list8[[3]])), as.array(coef(all.model.list8[[4]])),
+  as.array(coef(all.model.list8[[5]])), as.array(coef(all.model.list8[[6]])),
+  as.array(coef(all.model.list8[[7]])), as.array(coef(all.model.list8[[8]])),
+  as.array(coef(all.model.list8[[9]])))
+colnames(cf.all) = collars
+write.csv(cf.all, 'coefficientsAll.LASSO - no behavior.csv')
+
+cf8 = cbind(
+  as.array(coef(rest.model.list8[[1]])), as.array(coef(rest.model.list8[[2]])),
+  as.array(coef(rest.model.list8[[3]])), as.array(coef(rest.model.list8[[4]])),
+  as.array(coef(rest.model.list8[[5]])), as.array(coef(rest.model.list8[[6]])),
+  as.array(coef(rest.model.list8[[7]])), as.array(coef(rest.model.list8[[8]])),
+  as.array(coef(rest.model.list8[[9]])), 
+  as.array(coef(graz.model.list8[[1]])), as.array(coef(graz.model.list8[[2]])),
+  as.array(coef(graz.model.list8[[3]])), as.array(coef(graz.model.list8[[4]])),
+  as.array(coef(graz.model.list8[[5]])), as.array(coef(graz.model.list8[[6]])),
+  as.array(coef(graz.model.list8[[7]])), as.array(coef(graz.model.list8[[8]])),
+  as.array(coef(graz.model.list8[[9]])))
+colnames(cf8) = rep(collars, times = 2)
+write.csv(cf8, 'coefficientsAll.LASSO.csv')
+
+```
+
+## CREATE USE INTENSITY RASTER
+```{r}
+createRaster = function(coef) {
+  rest.raster =
+    scaled.elev * coef[2] +
+    scaled.slope * coef[3] +
+    scaled.ruggedness * coef[4] +
+    scaled.water * coef[5] +
+    scaled.salt * coef[6]
+  rest.raster = exp(rest.raster)
+  rest.raster = rest.raster / sum(as.data.frame(rest.raster, na.rm = T))
+  return(rest.raster)
+}
+
+# MasterRaster = stack(apply(X = cf8, FUN = createRaster, MARGIN = 2))
+# Angus = MasterRaster[[c(1,2,4,6)]]
+# Criollo = MasterRaster[[c(3,5,7,8,9)]]
+# 
+# RestRaster = MasterRaster[[1:9]]
+# RestMeanAngus = calc(RestRaster[[c(1,2,4,6)]], fun = mean)
+# RestMeanCriollo = calc(RestRaster[[c(3,5,7,8,9)]], fun = mean)
+# RestRaster = addLayer(RestRaster, c(RestMeanAngus, RestMeanCriollo))
+# names(RestRaster) = c("80333", "80335", "80338", "80339", "80342",
+#                            "80343", "80344", "80349", "80351", "Mean-Angus",
+#                       "Mean-Criollo")
+# GrazRaster = MasterRaster[[10:18]]
+# GrazMeanAngus = calc(GrazRaster[[c(1,2,4,6)]], fun = mean)
+# GrazMeanCriollo = calc(GrazRaster[[c(3,5,7,8,9)]], fun = mean)
+# GrazRaster = addLayer(GrazRaster, c(GrazMeanAngus, GrazMeanCriollo))
+# names(GrazRaster) = c("80333", "80335", "80338", "80339", "80342",
+#                            "80343", "80344", "80349", "80351", "Mean-Angus",
+#                       "Mean-Criollo")
+# 
+# MeanAngus = calc(MasterRaster[[c(1,2,4,6,10,11,13,15)]], fun = mean)
+# MeanCriollo = calc(MasterRaster[[c(3,5,7,8,9,12,14,16,17,18)]], fun = mean)
+# 
+# # plot individual use intensities
+indivBreed = c("80333 - Angus", "80335 - Angus", "80338 - Criollo",
+               "80339 - Angus", "80342 - Criollo", "80343 - Angus",
+               "80344 - Criollo", "80349 - Criollo", "80351 - Criollo")
+# plot(RestRaster[[c(3,5,7,8,9,1,2,4,6)]], 
+#      main = indivBreed[c(3,5,7,8,9,1,2,4,6)])
+# plot(GrazRaster[[c(3,5,7,8,9,1,2,4,6)]], 
+#      main = indivBreed[c(3,5,7,8,9,1,2,4,6)])
+# plot(RestRaster[[10:11]])
+# plot(GrazRaster[[10:11]])
+# 
+# RestFrame = as.data.frame(RestRaster, xy = T) %>%
+#   pivot_longer(cols = 3:13)
+# GrazFrame = as.data.frame(GrazRaster, xy = T) %>%
+#   pivot_longer(cols = 3:13)
+# RasterFrame = rbind(RestFrame, GrazFrame)
+# RasterFrame$activity = rep(c('Resting', 'Grazing'),
+#                               each = dim(GrazFrame)[1])
+# RasterFrame$breed = rep(c('Angus', 'Angus', 'Criollo', 'Angus', 'Criollo',
+#                           'Angus', 'Criollo', 'Criollo', 'Criollo',
+#                           'Angus', 'Criollo'), times = 80444)
+# names(RasterFrame)[3] = 'indiv'
+# 
+# breed.labs = c('Angus', 'Criollo')
+# names(breed.labs) = c('Mean.Angus', 'Mean.Criollo')
+# 
+# # RESTING MEAN - ANGUS VS CRIOLLO
+# temp = subset(RasterFrame, (activity == 'Resting' & indiv == "Mean.Criollo") |
+#                 (activity == 'Resting' & indiv == 'Mean.Angus'))
+# ggplot(temp) +
+#   geom_raster(aes(x = x, y = y, fill = value)) +
+#   facet_wrap(~indiv) +
+#   coord_sf() +
+#   scale_fill_viridis_c(na.value = 'white', option = 'turbo', direction = 1,
+#                        trans = 'log') +
+#   scale_x_continuous(breaks = seq(621000, 624000, length.out = 2)) +
+#   scale_y_continuous(breaks = seq(4221000, 4225000, length.out = 3)) +
+#   theme(text = element_text(color = "black", size = 30),
+#         legend.key.size = unit(2, 'cm')) +
+#   labs(title = 'Mean Relative Use Intensity', fill = 'Intensity')
+
+MasterRasterSimple = stack(apply(X = cf.all, FUN = createRaster, MARGIN = 2))
+MeanAngusAll = calc(MasterRasterSimple[[c(1,2,4,6)]], fun = mean)
+MeanCriolloAll = calc(MasterRasterSimple[[c(3,5,7,8,9)]], fun = mean)
+MasterRasterSimple = addLayer(MasterRasterSimple, c(MeanAngusAll, MeanCriolloAll))
+names(MasterRasterSimple) = c(indivBreed, "Mean-Angus", "Mean-Criollo")
+plot((MasterRasterSimple[[10:11]]))
+MasterFrameAll = as.data.frame(MasterRasterSimple, xy = T) %>%
+  pivot_longer(cols = 3:13)
+
+ggplot(subset(MasterFrameAll, name == 'Mean.Angus' | name == 'Mean.Criollo')) +
+  geom_raster(aes(x = x, y = y, fill = value)) +
+  facet_wrap(~ name) +
+  coord_sf() +
+  scale_fill_viridis_c(na.value = 'white', option = 'turbo', direction = 1,
+                       trans = 'log') +
+  scale_x_continuous(breaks = seq(621000, 624000, length.out = 2)) +
+  scale_y_continuous(breaks = seq(4221000, 4225000, length.out = 3)) +
+  theme(text = element_text(color = "black", size = 30),
+        legend.key.size = unit(2, 'cm')) +
+  labs(title = 'Mean Relative Use Intensity', fill = 'Intensity')
+
+
+```
+
+## RARIFY DATA TO ONE USED POINT PER HOUR
+```{r}
+DPcattle.frame$hour = hour(DPcattle.frame$date_time)
+DPcattle.frame$day = yday(DPcattle.frame$date_time)
+
+rarified_indices = DPcattle.frame %>% 
+  group_by(COLLAR, activity, hour, day) %>%
+  group_rows() %>%
+  sapply('[[', 1)
+DPrarified = DPcattle.frame[rarified_indices,]
+
+DPcattle.track.rare = mk_track(DPrarified, .x = coords.x1, .y = coords.x2,
+                          .t = date_time, COLLAR = COLLAR, BREED = BREED,
+                          ALTITUDE = ALTITUDE,
+                          TEMPERATURE = TEMPERATURE, DOP = DOP,
+                          SATELLITES = SATELLITES, speed = speed,
+                          activity = activity, time = time, date = date_time)
+```
+
+## RAREFIED TO ONE POINT PER HOUR
+```{r}
+# remove points from first and last three days
+DPcattle.track.rare.cropped = DPcattle.track.rare %>%
+  filter(date > entry + 3 & date < exit - 3)
+DPcattle.frame.rare.cropped = as.data.frame(DPcattle.track.rare.cropped)
+
+# create separate datasets for each activity level for each invididual
+rest.track.rare = subset(DPcattle.track.rare.cropped, activity == 'resting')
+rest.list.rare = split(x = rest.track.rare, 
+                       f = as.factor(rest.track.rare$COLLAR))[-8]
+rest.list.rare = lapply(rest.list.rare, `[`, c(1,2))
+graz.track.rare = subset(DPcattle.track.rare.cropped, activity == 'grazing')
+graz.list.rare = split(x = graz.track.rare, 
+                       f = as.factor(graz.track.rare$COLLAR))[-8]
+graz.list.rare = lapply(graz.list.rare, `[`, c(1,2))
+mov.track.rare = subset(DPcattle.track.rare.cropped, activity == 'traveling')
+```
+
+## LASSO MODEL SELECTION - RAREFIED DATA
+```{r}
+HSFmodel8 = function(used, avail) {
+  used$case_ = 1
+  avail$case_ = 0
+  all.points = rbind(used, avail)
+  all.points = all.points  %>%
+    #attach env covariates to observed and available pts
+    extract_covariates(scaled.elev) %>%
+    extract_covariates(scaled.slope) %>%
+    extract_covariates(scaled.ruggedness) %>%
+    extract_covariates(scaled.water) %>%
+    extract_covariates(scaled.salt) %>%
+    mutate(w = ifelse(case_, 1, 1e3))
+  # create training and testing dataset
+  model = glmnetUtils::cv.glmnet(case_ ~ drill_elev + tri + slope + 
+                                   log_water + log_salt,
+              data = all.points, weights = w,
+                   family = binomial(link = 'logit'))
+  return(model)
+}
+
+rest.model.list8.rare = lapply(X = rest.list.rare, FUN = HSFmodel8, avail = avail)
+graz.model.list8.rare = lapply(X = graz.list.rare, FUN = HSFmodel8, avail = avail)
+
+cf8.rare = cbind(
+  as.array(coef(rest.model.list8.rare[[1]])),
+  as.array(coef(rest.model.list8.rare[[2]])),
+  as.array(coef(rest.model.list8.rare[[3]])),
+  as.array(coef(rest.model.list8.rare[[4]])),
+  as.array(coef(rest.model.list8.rare[[5]])),
+  as.array(coef(rest.model.list8.rare[[6]])),
+  as.array(coef(rest.model.list8.rare[[7]])),
+  as.array(coef(rest.model.list8.rare[[8]])),
+  as.array(coef(rest.model.list8.rare[[9]])), 
+  as.array(coef(graz.model.list8.rare[[1]])),
+  as.array(coef(graz.model.list8.rare[[2]])),
+  as.array(coef(graz.model.list8.rare[[3]])),
+  as.array(coef(graz.model.list8.rare[[4]])),
+  as.array(coef(graz.model.list8.rare[[5]])),
+  as.array(coef(graz.model.list8.rare[[6]])),
+  as.array(coef(graz.model.list8.rare[[7]])),
+  as.array(coef(graz.model.list8.rare[[8]])),
+  as.array(coef(graz.model.list8.rare[[9]])))
+colnames(cf8.rare) = rep(collars, times = 2)
+write.csv(cf8.rare, 'coefficientsRarefied.LASSO.csv')
+
+```
+
+## SEPARATE FULL DATASET BY DAY AND NIGHT, RUN LASSO MODELS
+```{r}
+# remove first and last three days
+DPcattle.track.cropped = DPcattle.track %>%
+  filter(date > entry + 3 & date < exit - 3)
+DPcattle.frame.cropped = as.data.frame(DPcattle.track.cropped)
+
+# create separate datasets for each activity for each individual for night/day
+DPcattle.track.cropped$night = (DPcattle.track.cropped$time >= hms('19:00:00')) |
+  (DPcattle.track.cropped$time <= hms('05:00:00'))
+DPcattle.track.cropped$day = (DPcattle.track.cropped$time >= hms('07:00:00')) &
+  (DPcattle.track.cropped$time <= hms('17:00:00'))
+
+rest.day.track = subset(DPcattle.track.cropped, 
+                        activity == 'resting' & day == T)
+rest.day.list = split(x = rest.day.track, 
+                      f = as.factor(rest.day.track$COLLAR))[-8]
+rest.day.list = lapply(rest.day.list, `[`, c(1,2))
+rest.night.track = subset(DPcattle.track.cropped, 
+                        activity == 'resting' & night == T)
+rest.night.list = split(x = rest.night.track, 
+                      f = as.factor(rest.night.track$COLLAR))[-8]
+rest.night.list = lapply(rest.night.list, `[`, c(1,2))
+graz.day.track = subset(DPcattle.track.cropped, 
+                        activity == 'grazing' & day == T)
+graz.day.list = split(x = graz.day.track, 
+                      f = as.factor(graz.day.track$COLLAR))[-8]
+graz.day.list = lapply(graz.day.list, `[`, c(1,2))
+graz.night.track = subset(DPcattle.track.cropped, 
+                        activity == 'grazing' & night == T)
+graz.night.list = split(x = graz.night.track, 
+                      f = as.factor(graz.night.track$COLLAR))[-8]
+graz.night.list = lapply(graz.night.list, `[`, c(1,2))
+```
+
+## LASSO MODEL SELECTION - DIVIDED BY ACTIVITY AND TIME OF DAY
+```{r}
+rest.model.list.day = lapply(X = rest.day.list, FUN = HSFmodel8, avail = avail)
+rest.model.list.night = lapply(X = rest.night.list, FUN = HSFmodel8, 
+                               avail = avail)
+graz.model.list.day = lapply(X = graz.day.list, FUN = HSFmodel8, avail = avail)
+graz.model.list.night = lapply(X = graz.night.list, FUN = HSFmodel8, 
+                               avail = avail)
+
+cf8.2 = cbind(
+  as.array(coef(rest.model.list.day[[1]])),
+  as.array(coef(rest.model.list.day[[2]])),
+  as.array(coef(rest.model.list.day[[3]])),
+  as.array(coef(rest.model.list.day[[4]])),
+  as.array(coef(rest.model.list.day[[5]])),
+  as.array(coef(rest.model.list.day[[6]])),
+  as.array(coef(rest.model.list.day[[7]])),
+  as.array(coef(rest.model.list.day[[8]])),
+  as.array(coef(rest.model.list.day[[9]])),
+  as.array(coef(rest.model.list.night[[1]])),
+  as.array(coef(rest.model.list.night[[2]])),
+  as.array(coef(rest.model.list.night[[3]])),
+  as.array(coef(rest.model.list.night[[4]])),
+  as.array(coef(rest.model.list.night[[5]])),
+  as.array(coef(rest.model.list.night[[6]])),
+  as.array(coef(rest.model.list.night[[7]])),
+  as.array(coef(rest.model.list.night[[8]])),
+  as.array(coef(rest.model.list.night[[9]])),
+  as.array(coef(graz.model.list.day[[1]])),
+  as.array(coef(graz.model.list.day[[2]])),
+  as.array(coef(graz.model.list.day[[3]])),
+  as.array(coef(graz.model.list.day[[4]])),
+  as.array(coef(graz.model.list.day[[5]])),
+  as.array(coef(graz.model.list.day[[6]])),
+  as.array(coef(graz.model.list.day[[7]])),
+  as.array(coef(graz.model.list.day[[8]])),
+  as.array(coef(graz.model.list.day[[9]])),
+  as.array(coef(graz.model.list.night[[1]])),
+  as.array(coef(graz.model.list.night[[2]])),
+  as.array(coef(graz.model.list.night[[3]])),
+  as.array(coef(graz.model.list.night[[4]])),
+  as.array(coef(graz.model.list.night[[5]])),
+  as.array(coef(graz.model.list.night[[6]])),
+  as.array(coef(graz.model.list.night[[7]])),
+  as.array(coef(graz.model.list.night[[8]])),
+  as.array(coef(graz.model.list.night[[9]])))
+colnames(cf8.2) = rep(collars, times = 4)
+write.csv(cf8.2, 'coefficientsTOD.LASSO.csv')
+
+```
+
+## MAPS OF COLLAR LOCATIONS
+```{r}
+# individual locations with elev background
+# ggplot() +
+#   geom_raster(data = as.data.frame(elev.bounded, xy = T),
+#               aes(x = x, y = y, fill = layer)) +
+#   geom_point(data = as.data.frame(DPcattle.dat.new), aes(x = coords.x1,
+#                                                          y = coords.x2),
+#              size = .4, alpha = .5) +
+#   facet_wrap(~COLLAR, nrow = 2) +
+#   coord_sf() +
+#   scale_fill_viridis_c(na.value = 'white', option = 'mako', direction = -1) +
+#   scale_x_continuous(breaks = seq(621000, 624000, length.out = 2)) +
+#   scale_y_continuous(breaks = seq(4221000, 4225000, length.out = 3)) +
+#   theme(axis.text.x = element_text(color = "black", size = 8, angle = 30,
+#                                    vjust = .8, hjust = 0.8),
+#         axis.text.y = element_text(color = "black", size = 8)) +
+#   labs(fill = 'Elevation')
+#
+# # individual locations with slope background
+# ggplot() +
+#   geom_raster(data = as.data.frame(mask(slope.small, drill_pasture), xy = T),
+#               aes(x = x, y = y, fill = layer)) +
+#   geom_point(data = DPcattle.frame.revised, aes(x = x_, y = y_), size = .4,
+#              alpha = .5) +
+#   facet_wrap(~COLLAR, nrow = 2) +
+#   coord_sf() +
+#   scale_fill_viridis_c(na.value = 'white', option = 'mako', direction = -1) +
+#   scale_x_continuous(breaks = seq(621000, 624000, length.out = 2)) +
+#   scale_y_continuous(breaks = seq(4221000, 4225000, length.out = 3)) +
+#   theme(axis.text.x = element_text(color = "black", size = 8, angle = 30,
+#                                    vjust = .8, hjust = 0.8),
+#         axis.text.y = element_text(color = "black", size = 8)) +
+#   labs(fill = 'Slope')
+
+```
+
+### BUILDING MODELS FROM THE GROUND UP
+
+## ELEVATION ONLY ##
+```{r}
+elevModel = function(used, avail) {
+  used$case_ = 1
+  avail$case_ = 0
+  all.points = rbind(used, avail)
+  all.points = all.points  %>%
+    #attach env covariates to observed and available pts
+    extract_covariates(scaled.elev) %>%
+    mutate(w = ifelse(case_, 1, 1e3)) # add weight to background points
+  elevModel = glm(case_ ~ drill_elev,
+              data = all.points, weight = w,
+                   family = binomial(link = 'logit'))
+  return(elevModel)
+}
+
+elev.rest.models = lapply(X = rest.list, FUN = elevModel,
+                          avail = avail)
+elev.graz.models = lapply(X = graz.list, FUN = elevModel,
+                          avail = avail)
+
+# examine coefficient estimates of Elevation Only Model
+cfElev = cbind(
+  elev.rest.models[[1]]$coefficients, elev.rest.models[[2]]$coefficients,
+  elev.rest.models[[3]]$coefficients, elev.rest.models[[4]]$coefficients,
+  elev.rest.models[[5]]$coefficients, elev.rest.models[[6]]$coefficients,
+  elev.rest.models[[7]]$coefficients, elev.rest.models[[8]]$coefficients,
+  elev.rest.models[[9]]$coefficients,
+  elev.graz.models[[1]]$coefficients, elev.graz.models[[2]]$coefficients,
+  elev.graz.models[[3]]$coefficients, elev.graz.models[[4]]$coefficients,
+  elev.graz.models[[5]]$coefficients, elev.graz.models[[6]]$coefficients,
+  elev.graz.models[[7]]$coefficients, elev.graz.models[[8]]$coefficients,
+  elev.graz.models[[9]]$coefficients)
+colnames(cfElev) = rep(collars, times = 2)
+write.csv(cfElev, 'coefficient outputs/elev_coefficients.csv')
+```
+
+## RUGGEDNESS ONLY ##
+```{r}
+# triModel = function(used, avail) {
+#   used$case_ = 1
+#   avail$case_ = 0
+#   all.points = rbind(used, avail)
+#   all.points = all.points  %>%
+#     #attach env covariates to observed and available pts
+#     extract_covariates(scaled.ruggedness) %>%
+#     mutate(w = ifelse(case_, 1, 1e3))
+#   triModel = glm(case_ ~ tri,
+#               data = all.points, weight = w,
+#                    family = binomial(link = 'logit'))
+#   return(triModel)
+# }
+# 
+# tri.rest.models = lapply(X = rest.list, FUN = triModel,
+#                           avail = avail)
+# tri.graz.models = lapply(X = graz.list, FUN = triModel,
+#                           avail = avail)
+# 
+# # examine coefficient estimates of Elevation Only Model
+# cfTRI = cbind(
+#   tri.rest.models[[1]]$coefficients, tri.rest.models[[2]]$coefficients,
+#   tri.rest.models[[3]]$coefficients, tri.rest.models[[4]]$coefficients,
+#   tri.rest.models[[5]]$coefficients, tri.rest.models[[6]]$coefficients,
+#   tri.rest.models[[7]]$coefficients, tri.rest.models[[8]]$coefficients,
+#   tri.rest.models[[9]]$coefficients,
+#   tri.graz.models[[1]]$coefficients, tri.graz.models[[2]]$coefficients,
+#   tri.graz.models[[3]]$coefficients, tri.graz.models[[4]]$coefficients,
+#   tri.graz.models[[5]]$coefficients, tri.graz.models[[6]]$coefficients,
+#   tri.graz.models[[7]]$coefficients, tri.graz.models[[8]]$coefficients,
+#   tri.graz.models[[9]]$coefficients)
+# colnames(cfTRI) = rep(collars, times = 2)
+# write.csv(cfTRI, '../../../tri_coefficients.csv')
+```
+
+## SLOPE ONLY ##
+```{r}
+slopeModel = function(used, avail) {
+  used$case_ = 1
+  avail$case_ = 0
+  all.points = rbind(used, avail)
+  all.points = all.points  %>% 
+    #attach env covariates to observed and available pts 
+    extract_covariates(scaled.slope) %>%
+    mutate(w = ifelse(case_, 1, 1e3)) 
+  slopeModel = glm(case_ ~ slope, 
+              data = all.points, weight = w,
+                   family = binomial(link = 'logit'))
+  return(slopeModel)
+}
+
+slope.rest.models = lapply(X = rest.list, FUN = slopeModel, 
+                          avail = avail)
+slope.graz.models = lapply(X = graz.list, FUN = slopeModel, 
+                          avail = avail)
+
+# examine coefficient estimates of Slope Only Model
+cfSlope = cbind(
+  slope.rest.models[[1]]$coefficients, slope.rest.models[[2]]$coefficients,
+  slope.rest.models[[3]]$coefficients, slope.rest.models[[4]]$coefficients,
+  slope.rest.models[[5]]$coefficients, slope.rest.models[[6]]$coefficients,
+  slope.rest.models[[7]]$coefficients, slope.rest.models[[8]]$coefficients,
+  slope.rest.models[[9]]$coefficients,
+  slope.graz.models[[1]]$coefficients, slope.graz.models[[2]]$coefficients,
+  slope.graz.models[[3]]$coefficients, slope.graz.models[[4]]$coefficients,
+  slope.graz.models[[5]]$coefficients, slope.graz.models[[6]]$coefficients,
+  slope.graz.models[[7]]$coefficients, slope.graz.models[[8]]$coefficients,
+  slope.graz.models[[9]]$coefficients)
+colnames(cfSlope) = rep(collars, times = 2)
+write.csv(cfSlope, 'coefficient outputs/slope_coefficients.csv')
+```
+
+## WATER ONLY ##
+```{r}
+waterModel = function(used, avail) {
+  used$case_ = 1
+  avail$case_ = 0
+  all.points = rbind(used, avail)
+  all.points = all.points  %>% 
+    #attach env covariates to observed and available pts 
+    extract_covariates(scaled.water) %>%
+    mutate(w = ifelse(case_, 1, 1e3)) 
+  waterModel = glm(case_ ~ log_water, 
+              data = all.points, weight = w,
+                   family = binomial(link = 'logit'))
+  return(waterModel)
+}
+
+water.rest.models = lapply(X = rest.list, FUN = waterModel, 
+                          avail = avail)
+water.graz.models = lapply(X = graz.list, FUN = waterModel, 
+                          avail = avail)
+
+# examine coefficient estimates of Slope Only Model
+cfWater = cbind(
+  water.rest.models[[1]]$coefficients, water.rest.models[[2]]$coefficients,
+  water.rest.models[[3]]$coefficients, water.rest.models[[4]]$coefficients,
+  water.rest.models[[5]]$coefficients, water.rest.models[[6]]$coefficients,
+  water.rest.models[[7]]$coefficients, water.rest.models[[8]]$coefficients,
+  water.rest.models[[9]]$coefficients,
+  water.graz.models[[1]]$coefficients, water.graz.models[[2]]$coefficients,
+  water.graz.models[[3]]$coefficients, water.graz.models[[4]]$coefficients,
+  water.graz.models[[5]]$coefficients, water.graz.models[[6]]$coefficients,
+  water.graz.models[[7]]$coefficients, water.graz.models[[8]]$coefficients,
+  water.graz.models[[9]]$coefficients)
+colnames(cfWater) = rep(collars, times = 2)
+write.csv(cfWater, 'coefficient outputs/water_coefficients.csv')
+```
+
+## SALT ONLY ##
+```{r}
+saltModel = function(used, avail) {
+  used$case_ = 1
+  avail$case_ = 0
+  all.points = rbind(used, avail)
+  all.points = all.points  %>% 
+    #attach env covariates to observed and available pts 
+    extract_covariates(scaled.salt) %>%
+    mutate(w = ifelse(case_, 1, 1e3)) 
+  saltModel = glm(case_ ~ log_salt, 
+              data = all.points, weight = w,
+                   family = binomial(link = 'logit'))
+  return(saltModel)
+}
+
+salt.rest.models = lapply(X = rest.list, FUN = saltModel, 
+                          avail = avail)
+salt.graz.models = lapply(X = graz.list, FUN = saltModel, 
+                          avail = avail)
+
+# examine coefficient estimates of Slope Only Model
+cfSalt = cbind(
+  salt.rest.models[[1]]$coefficients, salt.rest.models[[2]]$coefficients,
+  salt.rest.models[[3]]$coefficients, salt.rest.models[[4]]$coefficients,
+  salt.rest.models[[5]]$coefficients, salt.rest.models[[6]]$coefficients,
+  salt.rest.models[[7]]$coefficients, salt.rest.models[[8]]$coefficients,
+  salt.rest.models[[9]]$coefficients,
+  salt.graz.models[[1]]$coefficients, salt.graz.models[[2]]$coefficients,
+  salt.graz.models[[3]]$coefficients, salt.graz.models[[4]]$coefficients,
+  salt.graz.models[[5]]$coefficients, salt.graz.models[[6]]$coefficients,
+  salt.graz.models[[7]]$coefficients, salt.graz.models[[8]]$coefficients,
+  salt.graz.models[[9]]$coefficients)
+colnames(cfSalt) = rep(collars, times = 2)
+write.csv(cfSalt, 'coefficient outputs/salt_coefficients.csv')
+```
+
+## HERBACEOUS COVER ONLY ##
+```{r}
+herbModel = function(used, avail) {
+  used$case_ = 1
+  avail$case_ = 0
+  all.points = rbind(used, avail)
+  all.points = all.points  %>% 
+    #attach env covariates to observed and available pts 
+    extract_covariates(scaled.herb) %>%
+    mutate(w = ifelse(case_, 1, 1e3)) 
+  herbModel = glm(case_ ~ herb, 
+              data = all.points, weight = w,
+                   family = binomial(link = 'logit'))
+  return(herbModel)
+}
+
+herb.rest.models = lapply(X = rest.list, FUN = herbModel, 
+                          avail = avail)
+herb.graz.models = lapply(X = graz.list, FUN = herbModel, 
+                          avail = avail)
+
+# examine coefficient estimates of Slope Only Model
+cfHerb = cbind(
+  herb.rest.models[[1]]$coefficients, herb.rest.models[[2]]$coefficients,
+  herb.rest.models[[3]]$coefficients, herb.rest.models[[4]]$coefficients,
+  herb.rest.models[[5]]$coefficients, herb.rest.models[[6]]$coefficients,
+  herb.rest.models[[7]]$coefficients, herb.rest.models[[8]]$coefficients,
+  herb.rest.models[[9]]$coefficients,
+  herb.graz.models[[1]]$coefficients, herb.graz.models[[2]]$coefficients,
+  herb.graz.models[[3]]$coefficients, herb.graz.models[[4]]$coefficients,
+  herb.graz.models[[5]]$coefficients, herb.graz.models[[6]]$coefficients,
+  herb.graz.models[[7]]$coefficients, herb.graz.models[[8]]$coefficients,
+  herb.graz.models[[9]]$coefficients)
+colnames(cfHerb) = rep(collars, times = 2)
+write.csv(cfHerb, 'coefficient outputs/herb_coefficients.csv')
+```
+
+## SHRUB COVER ONLY ##
+```{r}
+shrubModel = function(used, avail) {
+  used$case_ = 1
+  avail$case_ = 0
+  all.points = rbind(used, avail)
+  all.points = all.points  %>% 
+    #attach env covariates to observed and available pts 
+    extract_covariates(scaled.SHR) %>%
+    mutate(w = ifelse(case_, 1, 1e3)) 
+  shrubModel = glm(case_ ~ SHR, 
+              data = all.points, weight = w,
+                   family = binomial(link = 'logit'))
+  return(shrubModel)
+}
+
+shrub.rest.models = lapply(X = rest.list, FUN = shrubModel, 
+                          avail = avail)
+shrub.graz.models = lapply(X = graz.list, FUN = shrubModel, 
+                          avail = avail)
+
+# examine coefficient estimates of shrub Only Model
+cfShrub = cbind(
+  shrub.rest.models[[1]]$coefficients, shrub.rest.models[[2]]$coefficients,
+  shrub.rest.models[[3]]$coefficients, shrub.rest.models[[4]]$coefficients,
+  shrub.rest.models[[5]]$coefficients, shrub.rest.models[[6]]$coefficients,
+  shrub.rest.models[[7]]$coefficients, shrub.rest.models[[8]]$coefficients,
+  shrub.rest.models[[9]]$coefficients,
+  shrub.graz.models[[1]]$coefficients, shrub.graz.models[[2]]$coefficients,
+  shrub.graz.models[[3]]$coefficients, shrub.graz.models[[4]]$coefficients,
+  shrub.graz.models[[5]]$coefficients, shrub.graz.models[[6]]$coefficients,
+  shrub.graz.models[[7]]$coefficients, shrub.graz.models[[8]]$coefficients,
+  shrub.graz.models[[9]]$coefficients)
+colnames(cfShrub) = rep(collars, times = 2)
+write.csv(cfShrub, 'coefficient outputs/shrub_coefficients.csv')
+```
+
+## TREE COVER ONLY ##
+```{r}
+treeModel = function(used, avail) {
+  used$case_ = 1
+  avail$case_ = 0
+  all.points = rbind(used, avail)
+  all.points = all.points  %>% 
+    #attach env covariates to observed and available pts 
+    extract_covariates(scaled.TREE) %>%
+    mutate(w = ifelse(case_, 1, 1e3)) 
+  treeModel = glm(case_ ~ TREE, 
+              data = all.points, weight = w,
+                   family = binomial(link = 'logit'))
+  return(treeModel)
+}
+
+tree.rest.models = lapply(X = rest.list, FUN = treeModel, 
+                          avail = avail)
+tree.graz.models = lapply(X = graz.list, FUN = treeModel, 
+                          avail = avail)
+
+# examine coefficient estimates of Slope Only Model
+cfTree = cbind(
+  tree.rest.models[[1]]$coefficients, tree.rest.models[[2]]$coefficients,
+  tree.rest.models[[3]]$coefficients, tree.rest.models[[4]]$coefficients,
+  tree.rest.models[[5]]$coefficients, tree.rest.models[[6]]$coefficients,
+  tree.rest.models[[7]]$coefficients, tree.rest.models[[8]]$coefficients,
+  tree.rest.models[[9]]$coefficients,
+  tree.graz.models[[1]]$coefficients, tree.graz.models[[2]]$coefficients,
+  tree.graz.models[[3]]$coefficients, tree.graz.models[[4]]$coefficients,
+  tree.graz.models[[5]]$coefficients, tree.graz.models[[6]]$coefficients,
+  tree.graz.models[[7]]$coefficients, tree.graz.models[[8]]$coefficients,
+  tree.graz.models[[9]]$coefficients)
+colnames(cfTree) = rep(collars, times = 2)
+write.csv(cfTree, 'coefficient outputs/tree_coefficients.csv')
+```
+
+## SLOPE PLUS HERBACEOUS COVER
+```{r}
+# HSFmodel2.1 = function(used, avail) {
+#   used$case_ = 1
+#   avail$case_ = 0
+#   all.points = rbind(used, avail)
+#   all.points = all.points  %>%
+#     #attach env covariates to observed and available pts
+#     extract_covariates(scaled.slope) %>%
+#     extract_covariates(scaled.herb) %>%
+#     mutate(w = ifelse(case_, 1, 1e3))
+#   model = glm(case_ ~ herb + slope,
+#               data = all.points, weight = w,
+#                    family = binomial(link = 'logit'))
+#   return(model)
+# }
+# 
+# rest.model.list2.1 = lapply(X = rest.list, FUN = HSFmodel2.1,
+#                           avail = avail)
+# graz.model.list2.1 = lapply(X = graz.list, FUN = HSFmodel2.1,
+#                           avail = avail)
+# 
+# cf2.1 = cbind(
+#   rest.model.list2.1[[1]]$coefficients, rest.model.list2.1[[2]]$coefficients,
+#   rest.model.list2.1[[3]]$coefficients, rest.model.list2.1[[4]]$coefficients,
+#   rest.model.list2.1[[5]]$coefficients, rest.model.list2.1[[6]]$coefficients,
+#   rest.model.list2.1[[7]]$coefficients, rest.model.list2.1[[8]]$coefficients,
+#   rest.model.list2.1[[9]]$coefficients,
+#   graz.model.list2.1[[1]]$coefficients, graz.model.list2.1[[2]]$coefficients,
+#   graz.model.list2.1[[3]]$coefficients, graz.model.list2.1[[4]]$coefficients,
+#   graz.model.list2.1[[5]]$coefficients, graz.model.list2.1[[6]]$coefficients,
+#   graz.model.list2.1[[7]]$coefficients, graz.model.list2.1[[8]]$coefficients,
+#   graz.model.list2.1[[9]]$coefficients)
+# colnames(cf2.1) = rep(collars, times = 2)
+# write.csv(cf2.1, 'coefficient outputs/coefficientsSlopeHerb.csv')
+```
+
+## SLOPE PLUS SHRUB COVER
+```{r}
+# HSFmodel2.2 = function(used, avail) {
+#   used$case_ = 1
+#   avail$case_ = 0
+#   all.points = rbind(used, avail)
+#   all.points = all.points  %>%
+#     #attach env covariates to observed and available pts
+#     extract_covariates(scaled.slope) %>%
+#     extract_covariates(scaled.SHR) %>%
+#     mutate(w = ifelse(case_, 1, 1e3))
+#   model = glm(case_ ~ SHR + slope,
+#               data = all.points, weight = w,
+#                    family = binomial(link = 'logit'))
+#   return(model)
+# }
+# 
+# rest.model.list2.2 = lapply(X = rest.list, FUN = HSFmodel2.2,
+#                           avail = avail)
+# graz.model.list2.2 = lapply(X = graz.list, FUN = HSFmodel2.2,
+#                           avail = avail)
+# 
+# cf2.2 = cbind(
+#   rest.model.list2.2[[1]]$coefficients, rest.model.list2.2[[2]]$coefficients,
+#   rest.model.list2.2[[3]]$coefficients, rest.model.list2.2[[4]]$coefficients,
+#   rest.model.list2.2[[5]]$coefficients, rest.model.list2.2[[6]]$coefficients,
+#   rest.model.list2.2[[7]]$coefficients, rest.model.list2.2[[8]]$coefficients,
+#   rest.model.list2.2[[9]]$coefficients,
+#   graz.model.list2.2[[1]]$coefficients, graz.model.list2.2[[2]]$coefficients,
+#   graz.model.list2.2[[3]]$coefficients, graz.model.list2.2[[4]]$coefficients,
+#   graz.model.list2.2[[5]]$coefficients, graz.model.list2.2[[6]]$coefficients,
+#   graz.model.list2.2[[7]]$coefficients, graz.model.list2.2[[8]]$coefficients,
+#   graz.model.list2.2[[9]]$coefficients)
+# colnames(cf2.2) = rep(collars, times = 2)
+# write.csv(cf2.2, 'coefficient outputs/coefficientsSlopeShrub.csv')
+```
+
+## SLOPE PLUS TREE COVER
+```{r}
+# HSFmodel2.3 = function(used, avail) {
+#   used$case_ = 1
+#   avail$case_ = 0
+#   all.points = rbind(used, avail)
+#   all.points = all.points  %>%
+#     #attach env covariates to observed and available pts
+#     extract_covariates(scaled.slope) %>%
+#     extract_covariates(scaled.TREE) %>%
+#     mutate(w = ifelse(case_, 1, 1e3))
+#   model = glm(case_ ~ TREE + slope,
+#               data = all.points, weight = w,
+#                    family = binomial(link = 'logit'))
+#   return(model)
+# }
+# 
+# rest.model.list2.3 = lapply(X = rest.list, FUN = HSFmodel2.3,
+#                           avail = avail)
+# graz.model.list2.3 = lapply(X = graz.list, FUN = HSFmodel2.3,
+#                           avail = avail)
+# 
+# cf2.3 = cbind(
+#   rest.model.list2.3[[1]]$coefficients, rest.model.list2.3[[2]]$coefficients,
+#   rest.model.list2.3[[3]]$coefficients, rest.model.list2.3[[4]]$coefficients,
+#   rest.model.list2.3[[5]]$coefficients, rest.model.list2.3[[6]]$coefficients,
+#   rest.model.list2.3[[7]]$coefficients, rest.model.list2.3[[8]]$coefficients,
+#   rest.model.list2.3[[9]]$coefficients,
+#   graz.model.list2.3[[1]]$coefficients, graz.model.list2.3[[2]]$coefficients,
+#   graz.model.list2.3[[3]]$coefficients, graz.model.list2.3[[4]]$coefficients,
+#   graz.model.list2.3[[5]]$coefficients, graz.model.list2.3[[6]]$coefficients,
+#   graz.model.list2.3[[7]]$coefficients, graz.model.list2.3[[8]]$coefficients,
+#   graz.model.list2.3[[9]]$coefficients)
+# colnames(cf2.3) = rep(collars, times = 2)
+# write.csv(cf2.3, 'coefficient outputs/coefficientsSlopeTree.csv')
+
+```
+
+## SLOPE PLUS log(WATER)
+```{r}
+HSFmodel2.4 = function(used, avail) {
+  used$case_ = 1
+  avail$case_ = 0
+  all.points = rbind(used, avail)
+  all.points = all.points  %>%
+    #attach env covariates to observed and available pts
+    extract_covariates(scaled.slope) %>%
+    extract_covariates(scaled.water) %>%
+    mutate(w = ifelse(case_, 1, 1e3))
+  model = glm(case_ ~ log_water + slope,
+              data = all.points, weight = w,
+                   family = binomial(link = 'logit'))
+  return(model)
+}
+
+rest.model.list2.4 = lapply(X = rest.list, FUN = HSFmodel2.4,
+                          avail = avail)
+graz.model.list2.4 = lapply(X = graz.list, FUN = HSFmodel2.4,
+                          avail = avail)
+
+cf2.4 = cbind(
+  rest.model.list2.4[[1]]$coefficients, rest.model.list2.4[[2]]$coefficients,
+  rest.model.list2.4[[3]]$coefficients, rest.model.list2.4[[4]]$coefficients,
+  rest.model.list2.4[[5]]$coefficients, rest.model.list2.4[[6]]$coefficients,
+  rest.model.list2.4[[7]]$coefficients, rest.model.list2.4[[8]]$coefficients,
+  rest.model.list2.4[[9]]$coefficients,
+  graz.model.list2.4[[1]]$coefficients, graz.model.list2.4[[2]]$coefficients,
+  graz.model.list2.4[[3]]$coefficients, graz.model.list2.4[[4]]$coefficients,
+  graz.model.list2.4[[5]]$coefficients, graz.model.list2.4[[6]]$coefficients,
+  graz.model.list2.4[[7]]$coefficients, graz.model.list2.4[[8]]$coefficients,
+  graz.model.list2.4[[9]]$coefficients)
+colnames(cf2.4) = rep(collars, times = 2)
+write.csv(cf2.4, 'coefficient outputs/coefficientsSlopeWater.csv')
+
+```
+
+## SLOPE PLUS log(SALT)
+```{r}
+HSFmodel2.5 = function(used, avail) {
+  used$case_ = 1
+  avail$case_ = 0
+  all.points = rbind(used, avail)
+  all.points = all.points  %>%
+    #attach env covariates to observed and available pts
+    extract_covariates(scaled.slope) %>%
+    extract_covariates(scaled.salt) %>%
+    mutate(w = ifelse(case_, 1, 1e3))
+  model = glm(case_ ~ log_salt + slope,
+              data = all.points, weight = w,
+                   family = binomial(link = 'logit'))
+  return(model)
+}
+
+rest.model.list2.5 = lapply(X = rest.list, FUN = HSFmodel2.5,
+                          avail = avail)
+graz.model.list2.5 = lapply(X = graz.list, FUN = HSFmodel2.5,
+                          avail = avail)
+
+cf2.5 = cbind(
+  rest.model.list2.5[[1]]$coefficients, rest.model.list2.5[[2]]$coefficients,
+  rest.model.list2.5[[3]]$coefficients, rest.model.list2.5[[4]]$coefficients,
+  rest.model.list2.5[[5]]$coefficients, rest.model.list2.5[[6]]$coefficients,
+  rest.model.list2.5[[7]]$coefficients, rest.model.list2.5[[8]]$coefficients,
+  rest.model.list2.5[[9]]$coefficients,
+  graz.model.list2.5[[1]]$coefficients, graz.model.list2.5[[2]]$coefficients,
+  graz.model.list2.5[[3]]$coefficients, graz.model.list2.5[[4]]$coefficients,
+  graz.model.list2.5[[5]]$coefficients, graz.model.list2.5[[6]]$coefficients,
+  graz.model.list2.5[[7]]$coefficients, graz.model.list2.5[[8]]$coefficients,
+  graz.model.list2.5[[9]]$coefficients)
+colnames(cf2.5) = rep(collars, times = 2)
+write.csv(cf2.5, 'coefficient outputs/coefficientsSlopeSalt.csv')
+```
+
+## SLOPE AND ELEV
+```{r}
+HSFmodel2.7 = function(used, avail) {
+  used$case_ = 1
+  avail$case_ = 0
+  all.points = rbind(used, avail)
+  all.points = all.points  %>%
+    #attach env covariates to observed and available pts
+    extract_covariates(scaled.slope) %>%
+    extract_covariates(scaled.elev) %>%
+    mutate(w = ifelse(case_, 1, 1e3))
+  model = glm(case_ ~ drill_elev + slope,
+              data = all.points, weight = w,
+                   family = binomial(link = 'logit'))
+  return(model)
+}
+
+rest.model.list2.7 = lapply(X = rest.list, FUN = HSFmodel2.7,
+                          avail = avail)
+graz.model.list2.7 = lapply(X = graz.list, FUN = HSFmodel2.7,
+                          avail = avail)
+
+cf2.7 = cbind(
+  rest.model.list2.7[[1]]$coefficients, rest.model.list2.7[[2]]$coefficients,
+  rest.model.list2.7[[3]]$coefficients, rest.model.list2.7[[4]]$coefficients,
+  rest.model.list2.7[[5]]$coefficients, rest.model.list2.7[[6]]$coefficients,
+  rest.model.list2.7[[7]]$coefficients, rest.model.list2.7[[8]]$coefficients,
+  rest.model.list2.7[[9]]$coefficients,
+  graz.model.list2.7[[1]]$coefficients, graz.model.list2.7[[2]]$coefficients,
+  graz.model.list2.7[[3]]$coefficients, graz.model.list2.7[[4]]$coefficients,
+  graz.model.list2.7[[5]]$coefficients, graz.model.list2.7[[6]]$coefficients,
+  graz.model.list2.7[[7]]$coefficients, graz.model.list2.7[[8]]$coefficients,
+  graz.model.list2.7[[9]]$coefficients)
+colnames(cf2.7) = rep(collars, times = 2)
+write.csv(cf2.7, 'coefficient outputs/coefficientsSlopeElev.csv')
+
+```
+
+## SLOPE, SALT, AND WATER
+```{r}
+HSFmodel3.1 = function(used, avail) {
+  used$case_ = 1
+  avail$case_ = 0
+  all.points = rbind(used, avail)
+  all.points = all.points  %>%
+    #attach env covariates to observed and available pts
+    extract_covariates(scaled.slope) %>%
+    extract_covariates(scaled.water) %>%
+    extract_covariates(scaled.salt) %>%
+    mutate(w = ifelse(case_, 1, 1e3))
+  model = glm(case_ ~ log_water + log_salt + slope,
+              data = all.points, weight = w,
+                   family = binomial(link = 'logit'))
+  return(model)
+}
+
+rest.model.list3.1 = lapply(X = rest.list, FUN = HSFmodel3.1,
+                          avail = avail)
+graz.model.list3.1 = lapply(X = graz.list, FUN = HSFmodel3.1,
+                          avail = avail)
+
+cf3.1 = cbind(
+  rest.model.list3.1[[1]]$coefficients, rest.model.list3.1[[2]]$coefficients,
+  rest.model.list3.1[[3]]$coefficients, rest.model.list3.1[[4]]$coefficients,
+  rest.model.list3.1[[5]]$coefficients, rest.model.list3.1[[6]]$coefficients,
+  rest.model.list3.1[[7]]$coefficients, rest.model.list3.1[[8]]$coefficients,
+  rest.model.list3.1[[9]]$coefficients,
+  graz.model.list3.1[[1]]$coefficients, graz.model.list3.1[[2]]$coefficients,
+  graz.model.list3.1[[3]]$coefficients, graz.model.list3.1[[4]]$coefficients,
+  graz.model.list3.1[[5]]$coefficients, graz.model.list3.1[[6]]$coefficients,
+  graz.model.list3.1[[7]]$coefficients, graz.model.list3.1[[8]]$coefficients,
+  graz.model.list3.1[[9]]$coefficients)
+colnames(cf3.1) = rep(collars, times = 2)
+write.csv(cf3.1, 'coefficient outputs/coefficientsSlopeWaterSalt.csv')
+```
+
+## SLOPE, ELEV, AND SALT
+```{r}
+HSFmodel3.2 = function(used, avail) {
+  used$case_ = 1
+  avail$case_ = 0
+  all.points = rbind(used, avail)
+  all.points = all.points  %>% 
+    #attach env covariates to observed and available pts
+    extract_covariates(scaled.slope) %>% 
+    extract_covariates(scaled.elev) %>%
+    extract_covariates(scaled.salt) %>%
+    mutate(w = ifelse(case_, 1, 1e3))
+  model = glm(case_ ~ slope + drill_elev + log_salt, 
+              data = all.points, weight = w,
+                   family = binomial(link = 'logit'))
+  return(model)
+}
+
+rest.model.list3.2 = lapply(X = rest.list, FUN = HSFmodel3.2, 
+                          avail = avail)
+graz.model.list3.2 = lapply(X = graz.list, FUN = HSFmodel3.2, 
+                          avail = avail)
+
+cf3.2 = cbind(
+  rest.model.list3.2[[1]]$coefficients, rest.model.list3.2[[2]]$coefficients,
+  rest.model.list3.2[[3]]$coefficients, rest.model.list3.2[[4]]$coefficients,
+  rest.model.list3.2[[5]]$coefficients, rest.model.list3.2[[6]]$coefficients,
+  rest.model.list3.2[[7]]$coefficients, rest.model.list3.2[[8]]$coefficients,
+  rest.model.list3.2[[9]]$coefficients,
+  graz.model.list3.2[[1]]$coefficients, graz.model.list3.2[[2]]$coefficients,
+  graz.model.list3.2[[3]]$coefficients, graz.model.list3.2[[4]]$coefficients,
+  graz.model.list3.2[[5]]$coefficients, graz.model.list3.2[[6]]$coefficients,
+  graz.model.list3.2[[7]]$coefficients, graz.model.list3.2[[8]]$coefficients,
+  graz.model.list3.2[[9]]$coefficients)
+colnames(cf3.2) = rep(collars, times = 2)
+write.csv(cf3.2, 'coefficient outputs/coefficientsSlopeElevSalt.csv')
+
+# createRaster3.2 = function(coef) {
+#   rest.raster = 
+#     slope.small * coef[2] +
+#     elev.small * coef[3] +
+#     1 * coef[4]
+#   rest.raster = exp(rest.raster)
+#   rest.raster = rest.raster / sum(as.data.frame(rest.raster, na.rm = T))
+#   return(rest.raster)
+# }
+# 
+# RestRaster3.2 = stack(lapply(X = lapply(rest.model.list3.2, "[[",
+#                                          "coefficients"),
+#                         FUN = createRaster3.2))
+# RestMeanAngus3.2 = calc(RestRaster3.2[[c(1,2,4,6)]], fun = mean)
+# RestMeanCriollo3.2 = calc(RestRaster3.2[[c(3,5,7,8,9)]], fun = mean)
+# RestRaster3.2 = addLayer(RestRaster3.2, c(RestMeanAngus3.2,
+#                                           RestMeanCriollo3.2))
+# names(RestRaster3.2) = c("80333", "80335", "80338", "80339", "80342",
+#                            "80343", "80344", "80349", "80351", "Mean-Angus",
+#                       "Mean-Criollo")
+# GrazRaster3.2 = stack(lapply(X = lapply(graz.model.list3.2, "[[",
+#                                          "coefficients"),
+#                         FUN = createRaster3.2))
+# GrazMeanAngus3.2 = calc(GrazRaster3.2[[c(1,2,4,6)]], fun = mean)
+# GrazMeanCriollo3.2 = calc(GrazRaster3.2[[c(3,5,7,8,9)]], fun = mean)
+# GrazRaster3.2 = addLayer(GrazRaster3.2, c(GrazMeanAngus3.2,
+#                                           GrazMeanCriollo3.2))
+# names(GrazRaster3.2) = c("80333", "80335", "80338", "80339", "80342",
+#                            "80343", "80344", "80349", "80351", "Mean-Angus",
+#                       "Mean-Criollo")
+# RestFrame3.2 = as.data.frame(RestRaster3.2, xy = T) %>%
+#   pivot_longer(cols = 3:13)
+# GrazFrame3.2 = as.data.frame(GrazRaster3.2, xy = T) %>%
+#   pivot_longer(cols = 3:13)
+# 
+# GrazMeanAll3.2 = calc(GrazRaster3.2, fun = mean)
+# MeanFrame3.2 = as.data.frame(GrazMeanAll3.2, xy = T)
+# 
+# ggplot(MeanFrame3.2) + 
+#   geom_raster(aes(x = x, y = y, fill = layer)) +
+#   coord_sf() +
+#   scale_fill_viridis_c(na.value = 'white', option = 'turbo', direction = 1) +
+#   scale_x_continuous(breaks = seq(621000, 624000, length.out = 2)) +
+#   scale_y_continuous(breaks = seq(4221000, 4225000, length.out = 3)) +
+#   theme(text = element_text(color = "black", size = 30),
+#         legend.key.size = unit(2, 'cm')) +
+#   labs(title = 'Mean Relative Use Intensity', fill = 'Intensity')
+# 
+# RasterFrame3.2 = rbind(RestFrame3.2, GrazFrame3.2)
+# RasterFrame3.2$activity = rep(c('Resting', 'Grazing'), 
+#                               each = dim(GrazFrame3.2)[1])
+# 
+# breed.labs = c('Angus', 'Criollo')
+# names(breed.labs) = c('Mean.Angus', 'Mean.Criollo')
+# ggplot(subset(RasterFrame3.2, 
+#               name == 'Mean.Angus' | name == "Mean.Criollo")) + 
+#   geom_raster(aes(x = x, y = y, fill = value)) +
+#   facet_grid(activity~name,
+#              labeller = labeller(name = breed.labs)) +
+#   coord_sf() +
+#   scale_fill_viridis_c(na.value = 'white', option = 'turbo', direction = 1) +
+#   scale_x_continuous(breaks = seq(621000, 624000, length.out = 2)) +
+#   scale_y_continuous(breaks = seq(4221000, 4225000, length.out = 3)) +
+#   theme(text = element_text(color = "black", size = 30),
+#         legend.key.size = unit(2, 'cm')) +
+#   labs(title = 'Mean Relative Use Intensity', fill = 'Intensity')
+# 
+# # export raster files
+# writeRaster(GrazMeanAll3.2, 'meanUseIntensity.tif', overwrite = T)
+# writeRaster(RestRaster3.2, '../../../RestingRelativeUseIntensity.tif')
+# writeRaster(GrazRaster3.2, '../../../GrazingRelativeUseIntensity.tif')
+# # import raster file to make sure it looks okay
+# a = raster('MeanUseIntensity.tif')
+# plot(a)
+# 
+# # export as shapefile
+# GrazMeanAllPoly = rasterToPolygons(GrazMeanAll3.2)
+# names(GrazMeanAllPoly)
+# spplot(GrazMeanAllPoly, 'layer')
+# raster::shapefile(GrazMeanAllPoly, 'meanUseIntensity.shp')
+# # import shapefile to make sure it looks okay
+
+```
+
+## SLOPE, ELEV, SALT, HERB
+```{r}
+# HSFmodel4.1 = function(used, avail) {
+#   used$case_ = 1
+#   avail$case_ = 0
+#   all.points = rbind(used, avail)
+#   all.points = all.points  %>% 
+#     #attach env covariates to observed and available pts
+#     extract_covariates(scaled.slope) %>% 
+#     extract_covariates(scaled.elev) %>%
+#     extract_covariates(scaled.salt) %>%
+#     extract_covariates(scaled.herb) %>%
+#     mutate(w = ifelse(case_, 1, 1e3))
+#   model = glm(case_ ~ slope + drill_elev + log_salt + herb, 
+#               data = all.points, weight = w,
+#                    family = binomial(link = 'logit'))
+#   return(model)
+# }
+# 
+# rest.model.list4.1 = lapply(X = rest.list, FUN = HSFmodel4.1, 
+#                           avail = avail)
+# graz.model.list4.1 = lapply(X = graz.list, FUN = HSFmodel4.1, 
+#                           avail = avail)
+# 
+# cf4.1 = cbind(
+#   rest.model.list4.1[[1]]$coefficients, rest.model.list4.1[[2]]$coefficients,
+#   rest.model.list4.1[[3]]$coefficients, rest.model.list4.1[[4]]$coefficients,
+#   rest.model.list4.1[[5]]$coefficients, rest.model.list4.1[[6]]$coefficients,
+#   rest.model.list4.1[[7]]$coefficients, rest.model.list4.1[[8]]$coefficients,
+#   rest.model.list4.1[[9]]$coefficients,
+#   graz.model.list4.1[[1]]$coefficients, graz.model.list4.1[[2]]$coefficients,
+#   graz.model.list4.1[[3]]$coefficients, graz.model.list4.1[[4]]$coefficients,
+#   graz.model.list4.1[[5]]$coefficients, graz.model.list4.1[[6]]$coefficients,
+#   graz.model.list4.1[[7]]$coefficients, graz.model.list4.1[[8]]$coefficients,
+#   graz.model.list4.1[[9]]$coefficients)
+# colnames(cf4.1) = rep(collars, times = 2)
+# write.csv(cf4.1, '../../../coefficientsSlopeElevSaltHerb.csv')
+```
+
+## SLOPE, ELEV, SALT, TRI
+```{r}
+# HSFmodel4.2 = function(used, avail) {
+#   used$case_ = 1
+#   avail$case_ = 0
+#   all.points = rbind(used, avail)
+#   all.points = all.points  %>% 
+#     #attach env covariates to observed and available pts
+#     extract_covariates(scaled.slope) %>% 
+#     extract_covariates(scaled.elev) %>%
+#     extract_covariates(scaled.salt) %>%
+#     extract_covariates(scaled.ruggedness) %>%
+#     mutate(w = ifelse(case_, 1, 1e3))
+#   model = glm(case_ ~ slope + drill_elev + log_salt + tri, 
+#               data = all.points, weight = w,
+#                    family = binomial(link = 'logit'))
+#   return(model)
+# }
+# 
+# rest.model.list4.2 = lapply(X = rest.list, FUN = HSFmodel4.2, 
+#                           avail = avail)
+# graz.model.list4.2 = lapply(X = graz.list, FUN = HSFmodel4.2, 
+#                           avail = avail)
+# 
+# cf4.2 = cbind(
+#   rest.model.list4.2[[1]]$coefficients, rest.model.list4.2[[2]]$coefficients,
+#   rest.model.list4.2[[3]]$coefficients, rest.model.list4.2[[4]]$coefficients,
+#   rest.model.list4.2[[5]]$coefficients, rest.model.list4.2[[6]]$coefficients,
+#   rest.model.list4.2[[7]]$coefficients, rest.model.list4.2[[8]]$coefficients,
+#   rest.model.list4.2[[9]]$coefficients,
+#   graz.model.list4.2[[1]]$coefficients, graz.model.list4.2[[2]]$coefficients,
+#   graz.model.list4.2[[3]]$coefficients, graz.model.list4.2[[4]]$coefficients,
+#   graz.model.list4.2[[5]]$coefficients, graz.model.list4.2[[6]]$coefficients,
+#   graz.model.list4.2[[7]]$coefficients, graz.model.list4.2[[8]]$coefficients,
+#   graz.model.list4.2[[9]]$coefficients)
+# colnames(cf4.2) = rep(collars, times = 2)
+# write.csv(cf4.2, '../../../coefficientsSlopeElevSaltTRI.csv')
+```
+
+## NO ELEV, NO SHRUB, NO TREE
+```{r}
+# HSFmodel5.2 = function(used, avail) {
+#   used$case_ = 1
+#   avail$case_ = 0
+#   all.points = rbind(used, avail)
+#   all.points = all.points  %>% 
+#     #attach env covariates to observed and available pts
+#     extract_covariates(scaled.slope) %>% 
+#     extract_covariates(scaled.elev) %>%
+#     extract_covariates(scaled.salt) %>%
+#     extract_covariates(scaled.ruggedness) %>%
+#     extract_covariates(scaled.herb) %>%
+#     mutate(w = ifelse(case_, 1, 1e3))
+#   model = glm(case_ ~ slope + drill_elev + log_salt + tri + herb, 
+#               data = all.points, weight = w,
+#                    family = binomial(link = 'logit'))
+#   return(model)
+# }
+# 
+# rest.model.list5.2 = lapply(X = rest.list, FUN = HSFmodel5.2, 
+#                             avail = avail)
+# graz.model.list5.2 = lapply(X = graz.list, FUN = HSFmodel5.2, 
+#                             avail = avail)
+# 
+# cf5.2 = cbind(
+#   rest.model.list5.2[[1]]$coefficients, rest.model.list5.2[[2]]$coefficients,
+#   rest.model.list5.2[[3]]$coefficients, rest.model.list5.2[[4]]$coefficients,
+#   rest.model.list5.2[[5]]$coefficients, rest.model.list5.2[[6]]$coefficients,
+#   rest.model.list5.2[[7]]$coefficients, rest.model.list5.2[[8]]$coefficients,
+#   rest.model.list5.2[[9]]$coefficients,
+#   graz.model.list5.2[[1]]$coefficients, graz.model.list5.2[[2]]$coefficients,
+#   graz.model.list5.2[[3]]$coefficients, graz.model.list5.2[[4]]$coefficients,
+#   graz.model.list5.2[[5]]$coefficients, graz.model.list5.2[[6]]$coefficients,
+#   graz.model.list5.2[[7]]$coefficients, graz.model.list5.2[[8]]$coefficients,
+#   graz.model.list5.2[[9]]$coefficients)
+# colnames(cf5.2) = rep(collars, times = 2)
+# write.csv(cf5.2, '../../../coefficientsSlopeElevSaltTRIHerb.csv')
+```
+
+## NO ELEV, NO SHRUB, NO TREE
+```{r}
+# HSFmodel5.1 = function(used, avail) {
+#   used$case_ = 1
+#   avail$case_ = 0
+#   all.points = rbind(used, avail)
+#   all.points = all.points  %>% 
+#     #attach env covariates to observed and available pts
+#     extract_covariates(scaled.herb) %>% 
+#     extract_covariates(scaled.ruggedness) %>%
+#     extract_covariates(scaled.slope) %>%
+#     extract_covariates(scaled.water) %>%
+#     extract_covariates(scaled.salt) %>%
+#     mutate(w = ifelse(case_, 1, 1e3))
+#   model = glm(case_ ~ herb + tri + slope + log_water + log_salt, 
+#               data = all.points, weight = w,
+#                    family = binomial(link = 'logit'))
+#   return(model)
+# }
+# 
+# rest.model.list5.1 = lapply(X = rest.list, FUN = HSFmodel5.1, 
+#                             avail = avail)
+# graz.model.list5.1 = lapply(X = graz.list, FUN = HSFmodel5.1, 
+#                             avail = avail)
+# 
+# cf5.1 = cbind(
+#   rest.model.list5.1[[1]]$coefficients, rest.model.list5.1[[2]]$coefficients,
+#   rest.model.list5.1[[3]]$coefficients, rest.model.list5.1[[4]]$coefficients,
+#   rest.model.list5.1[[5]]$coefficients, rest.model.list5.1[[6]]$coefficients,
+#   rest.model.list5.1[[7]]$coefficients, rest.model.list5.1[[8]]$coefficients,
+#   rest.model.list5.1[[9]]$coefficients,
+#   graz.model.list5.1[[1]]$coefficients, graz.model.list5.1[[2]]$coefficients,
+#   graz.model.list5.1[[3]]$coefficients, graz.model.list5.1[[4]]$coefficients,
+#   graz.model.list5.1[[5]]$coefficients, graz.model.list5.1[[6]]$coefficients,
+#   graz.model.list5.1[[7]]$coefficients, graz.model.list5.1[[8]]$coefficients,
+#   graz.model.list5.1[[9]]$coefficients)
+# colnames(cf5.1) = rep(collars, times = 2)
+# write.csv(cf5.1, '../../../coefficientsNoElevNoTreeNoShrub.csv')
+```
+
+## ALL COEFFICIENTS EXCEPT ELEVATION and RUGGEDNESS
+```{r}
+# HSFmodelSimple = function(used, avail) {
+#   used$case_ = 1
+#   avail$case_ = 0
+#   all.points = rbind(used, avail)
+# 
+#   all.points = all.points  %>%
+#     #attach env covariates to observed and available pts
+#     extract_covariates(scaled.herb) %>%
+#     extract_covariates(scaled.SHR) %>%
+#     extract_covariates(scaled.TREE) %>%
+#     extract_covariates(scaled.slope) %>%
+#     extract_covariates(scaled.water) %>%
+#     extract_covariates(scaled.salt) %>%
+#     mutate(w = ifelse(case_, 1, 1e3))
+#   model = glm(case_ ~ herb + SHR + TREE +
+#                 slope + log_water + log_salt,
+#               data = all.points, weight = w,
+#                    family = binomial(link = 'logit'))
+#   return(model)
+# }
+# 
+# rest.model.list1 = lapply(X = rest.list, FUN = HSFmodelSimple,
+#                           avail = avail)
+# graz.model.list1 = lapply(X = graz.list, FUN = HSFmodelSimple,
+#                           avail = avail)
+# 
+# cfSimple = cbind(
+#   rest.model.list1[[1]]$coefficients, rest.model.list1[[2]]$coefficients,
+#   rest.model.list1[[3]]$coefficients, rest.model.list1[[4]]$coefficients,
+#   rest.model.list1[[5]]$coefficients, rest.model.list1[[6]]$coefficients,
+#   rest.model.list1[[7]]$coefficients, rest.model.list1[[8]]$coefficients,
+#   rest.model.list1[[9]]$coefficients,
+#   graz.model.list1[[1]]$coefficients, graz.model.list1[[2]]$coefficients,
+#   graz.model.list1[[3]]$coefficients, graz.model.list1[[4]]$coefficients,
+#   graz.model.list1[[5]]$coefficients, graz.model.list1[[6]]$coefficients,
+#   graz.model.list1[[7]]$coefficients, graz.model.list1[[8]]$coefficients,
+#   graz.model.list1[[9]]$coefficients)
+# colnames(cfSimple) = rep(collars, times = 2)
+# write.csv(cfSimple, '../../../coefficients1.csv')
+```
+
+## ALL COEFFICIENTS EXCEPT ELEVATION
+```{r}
+# HSFmodel = function(used, avail) {
+#   used$case_ = 1
+#   avail$case_ = 0
+#   all.points = rbind(used, avail)
+#   all.points = all.points  %>% 
+#     #attach env covariates to observed and available pts
+#     extract_covariates(scaled.herb) %>% 
+#     extract_covariates(scaled.SHR) %>% 
+#     extract_covariates(scaled.TREE) %>% 
+#     extract_covariates(scaled.ruggedness) %>%
+#     extract_covariates(scaled.slope) %>%
+#     extract_covariates(scaled.water) %>%
+#     extract_covariates(scaled.salt) %>%
+#     mutate(w = ifelse(case_, 1, 1e3))
+#   model = glm(case_ ~ herb + SHR + TREE + tri +
+#                 slope + log_water + log_salt, 
+#               data = all.points, weight = w,
+#                    family = binomial(link = 'logit'))
+#   return(model)
+# }
+# 
+# rest.model.list = lapply(X = rest.list, FUN = HSFmodel, avail = avail)
+# graz.model.list = lapply(X = graz.list, FUN = HSFmodel, avail = avail)
+# 
+# cfAll = cbind(
+#   rest.model.list[[1]]$coefficients, rest.model.list[[2]]$coefficients,
+#   rest.model.list[[3]]$coefficients, rest.model.list[[4]]$coefficients,
+#   rest.model.list[[5]]$coefficients, rest.model.list[[6]]$coefficients,
+#   rest.model.list[[7]]$coefficients, rest.model.list[[8]]$coefficients,
+#   rest.model.list[[9]]$coefficients,
+#   graz.model.list[[1]]$coefficients, graz.model.list[[2]]$coefficients,
+#   graz.model.list[[3]]$coefficients, graz.model.list[[4]]$coefficients,
+#   graz.model.list[[5]]$coefficients, graz.model.list[[6]]$coefficients,
+#   graz.model.list[[7]]$coefficients, graz.model.list[[8]]$coefficients,
+#   graz.model.list[[9]]$coefficients)
+# colnames(cfAll) = rep(collars, times = 2)
+# write.csv(cfAll, '../../../coefficientsNoElev.csv')
+```

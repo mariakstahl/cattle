@@ -1,0 +1,269 @@
+---
+title: "drill oct-nov 2022"
+author: "Maria Stahl"
+date: "11/29/2022"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+rm(list = ls())
+```
+
+## Load necessary packages
+```{r}
+library(amt)
+library(dplyr)
+library(ggplot2)
+# library(glmnetUtils)
+# library(hms)
+library(lubridate)
+# library(raster)
+library(rgdal)
+library(rlist)
+library(sf)
+# library(stats)
+library(tidyr)
+library(tmap)
+```
+
+## Load in Drill Pasture shapefile
+```{r}
+drill_pasture = readOGR("Drill_Pasture/Drill_Pasture.shp")
+drill_pasture_sf = st_read("Drill_Pasture/Drill_Pasture.shp")
+```
+
+## Load in collar data
+```{r}
+cattle.dat.new = read.csv('GPS Combined 10.28.22-11.29.22.csv')
+cattle.dat.new = distinct(cattle.dat.new) %>%
+  filter(Julianday >= 318)
+
+# check how many individuals are in dataset
+levels(as.factor(cattle.dat.new$CollarSerialNumber))
+
+# data in UTM
+cattle.gps.new = st_as_sf(cattle.dat.new, coords = c('Longitude', 'Latitude'))
+st_crs(cattle.gps.new) = CRS("+proj=longlat +ellps=WGS84")
+cattle.gps.new = st_transform(cattle.gps.new, crs = st_crs(drill_pasture))
+
+ctmm::projection(cattle.gps.new) == ctmm::projection(drill_pasture)
+
+cattle.utm.new = as_Spatial(cattle.gps.new)
+
+# isolate points in Drill Pasture
+cattle.utm.drill = cattle.utm.new[!is.na(over(cattle.utm.new, as(drill_pasture,
+                                                 'SpatialPolygons'))),]
+
+rm(cattle.gps.new)
+
+### Check last day of data for all collars
+collars = unique(cattle.utm.new$CollarSerialNumber)
+last_day_collars = tapply(X = cattle.utm.new$Julianday, 
+                          INDEX = cattle.utm.new$CollarSerialNumber,
+                          FUN = max)
+last_day_collars
+
+```
+
+## add collar metadata
+```{r}
+metadata = read.csv('../Data/collars.peds_all.csv') %>%
+  rename(CollarSerialNumber = collar_oct22)
+
+metadata$tag_no = ifelse(metadata$tag_no == '', 'blank', metadata$tag_no)
+
+drill.points.sf = st_as_sf(cattle.utm.drill) %>%
+  merge(metadata, by = 'CollarSerialNumber')
+
+all.points.sf = st_as_sf(cattle.utm.new)%>%
+  merge(metadata, by = 'CollarSerialNumber')
+
+drill.points.sf$CollarSerialNumber = as.factor(drill.points.sf$CollarSerialNumber)
+all.points.sf$CollarSerialNumber = as.factor(all.points.sf$CollarSerialNumber)
+```
+
+# clean up dataframe
+```{r}
+drill.points.sf$date = as.Date(drill.points.sf$Julianday, origin = '2021-12-31')
+
+all.points.sf$date = as.Date(all.points.sf$Julianday, origin = '2021-12-31')
+```
+
+# add water and salt
+```{r}
+# features = read_sf('Drill 2020 water and salt.kml')
+# features$Name = c('trough1', 'trough2', 'trough3', 'trough4', 'trough5',
+#                   'salt_lick1', 'salt1', 'salt2', 'salt3', 'salt_lick4', 
+#                   'creek_trough')
+# features$Description = c('water', 'water', 'water', 'water', 'water', 'salt',
+#                          'salt', 'salt', 'salt', 'salt', 'outside')
+# features$geometry = st_transform(features$geometry, 
+#                                  crs = st_crs(drill_pasture_sf))
+```
+
+## Calculate activity modes
+```{r}
+# create date_time column
+all.points.sf$date_time = paste(all.points.sf$Hour, 
+                                 all.points.sf$Minute, sep = ':') %>%
+  paste(all.points.sf$date, .) %>%
+  as.POSIXct(format = '%Y-%m-%d %H:%M')
+
+# create track for individuals
+DPcattle.frame = all.points.sf %>%
+  mutate(x = st_coordinates(all.points.sf)[,1],
+         y = st_coordinates(all.points.sf)[,2])
+DPcattle.frame = DPcattle.frame[!is.na(DPcattle.frame$date_time),]
+DPcattle.frame$tag_no = as.factor(DPcattle.frame$tag_no)
+DPcattle.list = split(DPcattle.frame, f = DPcattle.frame$tag_no)
+DPtrack = lapply(DPcattle.list, FUN = mk_track, .x = x, .y = y,
+                 .t = date_time, crs = crs(all.points.sf), order_by_ts = T,
+                 check_duplicates = T)
+rm(DPcattle.list)
+
+breeds = DPcattle.frame %>%
+  as.data.frame() %>%
+  dplyr::select(tag_no, breed) %>%
+  distinct()
+
+# calculate velocity from track
+tags = levels(DPcattle.frame$tag_no)
+DPspeed = lapply(DPtrack, FUN = speed)
+for(i in seq(1:length(tags))){
+  c = tags[i]
+  DPtrack[[c]][4] = DPspeed[[c]]
+  names(DPtrack[[c]])[4] = 'speed'
+}
+
+# convert list back into data.frame
+DPspeed.frame = list.rbind(DPtrack)
+temp = array()
+for(i in seq(1:length(tags))){
+  temp = append(temp, rep(tags[i], times = dim(DPtrack[[i]])[1]))
+}
+temp = temp[!is.na(temp)]
+DPspeed.frame$tag_no = temp
+names(DPspeed.frame)[3] = 'date_time'
+rm(DPtrack)
+
+# merge DPcattle.frame and DPspeed.frame
+DPcattle.frame = merge(DPcattle.frame, DPspeed.frame, 
+                       by = c('tag_no','date_time'))
+
+# classify activity based on speed (from Nyamuryekung'e et al. 2021a)
+resting = 2.34/60 # max resting speed in m/s
+grazing = 25/60 # max grazing speed in m/s
+DPcattle.frame$activity = ifelse(DPcattle.frame$speed <= resting,
+                                 'resting', 
+                                 ifelse(DPcattle.frame$speed <= grazing,
+                                        'grazing', 'traveling'))
+
+
+```
+
+## plot points
+```{r}
+# ANGUS
+ggplot() +
+  geom_sf(data = subset(drill.points.sf, breed == 'Angus' & Julianday > 301), 
+                        aes(color = CollarSerialNumber), alpha = 0.5) +
+  geom_sf(data = drill_pasture_sf, aes(), fill = NA) +
+  facet_wrap(~date) +
+  scale_x_continuous(breaks = seq(621000, 624000, length.out = 2)) +
+  scale_y_continuous(breaks = seq(4221000, 4225000, length.out = 3)) +
+  coord_sf(datum = sf::st_crs(drill_pasture)) +
+  theme(text = element_text(color = "black", size = 20),
+        legend.key.size = unit(1.5, 'cm')) +
+  guides(color = 'none')
+
+# CRIOLLO
+ggplot() +
+  geom_sf(data = subset(drill.points.sf, breed == 'Criollo' & Julianday > 301), 
+                        aes(color = CollarSerialNumber), alpha = 0.5) +
+  geom_sf(data = drill_pasture_sf, aes(), fill = NA) +
+  geom_sf(data = features[1:10,], aes(shape = Description), alpha = 0.8) +
+  facet_wrap(~date) +
+  scale_x_continuous(breaks = seq(621000, 624000, length.out = 2)) +
+  scale_y_continuous(breaks = seq(4221000, 4225000, length.out = 3)) +
+  coord_sf(datum = sf::st_crs(drill_pasture)) +
+  theme(text = element_text(color = "black", size = 20),
+        legend.key.size = unit(1.5, 'cm')) +
+  guides(color = 'none')
+
+# all
+ggplot() +
+  geom_sf(data = subset(DPcattle.frame, Julianday > 308 & Julianday < 333 &
+                          activity == 'grazing'), 
+                        aes(color = Julianday), alpha = 0.5) +
+  geom_sf(data = drill_pasture_sf, aes(), fill = NA) +
+  facet_wrap(~breed) +
+  scale_x_continuous(breaks = seq(621000, 624000, length.out = 2)) +
+  scale_y_continuous(breaks = seq(4221000, 4225000, length.out = 3)) +
+  coord_sf(datum = sf::st_crs(drill_pasture)) +
+  theme(text = element_text(color = "black", size = 20),
+        legend.key.size = unit(1.5, 'cm'))
+```
+
+### how long did each cow spend in drill?
+```{r}
+indiv.drill = tapply(X = drill.points.sf$Minute, 
+                     INDEX = list(drill.points.sf$CollarSerialNumber,
+                                    drill.points.sf$breed),
+                     FUN = length)
+indiv.drill
+```
+
+### Read in pedometer data
+```{r}
+activity = read.csv('activity_March2022.csv')
+
+tags = as.data.frame(levels(as.factor(activity$Cow)))
+names(tags) = 'Cow'
+tags$breed = rep(c('Angus', 'Criollo'), each = 11)
+
+# convert column classes
+activity$Start = as.POSIXct(activity$Start)
+activity$End = as.POSIXct(activity$End)
+activity$Lying.Time = as.duration(hms(activity$Lying.Time))
+activity$Standing.Time = as.duration(hms(activity$Standing.Time))
+str(activity)
+
+# create simple date column
+activity$Date = as.Date(activity$Start)
+
+# calculate steps/lying time/standing time per day for each cow
+daily.activity = 
+  as.data.frame(tapply(X = activity$Steps, 
+                       INDEX = list(activity$Cow, activity$Date),
+                       FUN = sum)) 
+daily.activity$Cow = row.names(daily.activity)
+daily.activity = pivot_longer(daily.activity, cols = 1:25, names_to = "date",
+                              values_to = "total.steps")
+
+daily.activity$lying.time = as.data.frame(tapply(X = activity$Lying.Time, 
+           INDEX = list(activity$Cow, activity$Date),
+           FUN = sum)) %>%
+  pivot_longer(cols = 1:25, names_to = "date", 
+               values_to = "lying.time") %>%
+  select("lying.time") %>%
+  as.matrix()
+
+daily.activity$standing.time = as.data.frame(tapply(X = activity$Standing.Time, 
+           INDEX = list(activity$Cow, activity$Date),
+           FUN = sum)) %>%
+  pivot_longer(cols = 1:25, names_to = "date", 
+               values_to = "standing.time") %>%
+  select("standing.time") %>%
+  as.matrix()
+
+daily.activity = merge(daily.activity, tags, by = 'Cow')
+
+# visualizations
+ggplot(daily.activity) +
+  geom_histogram(aes(x = total.steps, fill = breed), position = 'dodge')
+```
+

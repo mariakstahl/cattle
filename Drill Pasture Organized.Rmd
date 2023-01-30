@@ -1,0 +1,415 @@
+---
+title: "Drill Pasture Organized"
+author: "Maria Stahl"
+date: "10/26/2021"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+rm(list = ls())
+```
+
+## Load necessary packages
+```{r}
+library(amt)
+library(dplyr)
+library(ggplot2)
+library(glmnetUtils)
+library(hms)
+library(lubridate)
+library(raster)
+library(rgdal)
+library(rlist)
+library(sf)
+library(stats)
+library(tidyr)
+library(tmap)
+```
+
+## Load in Drill Pasture shapefile
+```{r}
+drill_pasture = readOGR("Drill_Pasture/Drill_Pasture.shp")
+drill_pasture_sf = st_read("Drill_Pasture/Drill_Pasture.shp")
+```
+
+## Load in RAP data (raster created through Google Earth Engine)
+```{r}
+veg.dat.2020.small = stack('RAP_VegCover_2020_new.tif')
+
+veg.dat.2020.new = stack('RAP3_2020.tif')
+
+# reproject RAP data to UTM
+veg.dat.2020.small =
+  projectRaster(veg.dat.2020.small, crs = crs(drill_pasture))
+veg.dat.2020.small$herb = sum(veg.dat.2020.small$AFGC,
+                              veg.dat.2020.small$PFGC)
+veg.dat.2020.new =
+  projectRaster(veg.dat.2020.new, crs = crs(drill_pasture))
+veg.dat.2020.new$herb = sum(veg.dat.2020.new$AFG,
+                              veg.dat.2020.new$PFG)
+
+# mask full raster stack to cover only Drill Pasture
+DPveg = mask(veg.dat.2020.new, drill_pasture)
+DPveg.new = mask(veg.dat.2020.new, drill_pasture)
+
+par(mfrow = c(1,2))
+plot(DPveg.new$SHR)
+plot(DPveg$SHR)
+```
+
+## remove areas with >25% herbaceous cover
+We do this to remove the shadow from the mesa walls
+```{r}
+herb.buffered = DPveg$herb
+herb.buffered[herb.buffered > 25] = NA
+```
+
+## Read in elevation data and calculate ruggedness and slope (elev data from https://www.sciencebase.gov/catalog/item/5f7784be82ce1d74e7d6ca12)
+```{r}
+elev_orig = raster('USGS_13_n39w110.tif')
+temp = raster(extent(drill_pasture@bbox), crs = crs(drill_pasture),
+              resolution = 10)
+elev2 = projectRaster(elev_orig, temp)
+names(elev2) = 'drill_elev'
+
+# calculate ruggedness and slope
+ruggedness = terrain(elev2, opt = 'TRI', neighbors = 8)
+slope = terrain(elev2, opt = 'slope', neighbors = 8)
+```
+
+<!-- ## Read in soil classification data and state transition data (soil data from -->
+<!-- https://www.sciencebase.gov/catalog/item/5f76119e82cef8d1839c681d) -->
+<!-- ```{r} -->
+<!-- soilClasses = raster('SGU_1st_Class/SGU_1st_Class.tif') -->
+<!-- soilClasses2 = projectRaster(soilClasses, temp) -->
+
+<!-- stateTransition = stack('Grassland_StateTransition_Map_CANY_IndianCreek/Grassland_StateTransition_Map_CANY_IndianCreek.tif') -->
+<!-- stateTransition2 = projectRaster(stateTransition, temp) -->
+<!-- ``` -->
+
+## Load in collar data
+```{r}
+cattle.dat.new = read.csv('GPS Combined 2020-21 Winter.csv')
+cattle.dat.new = distinct(cattle.dat.new)
+
+# check how many individuals are in dataset
+levels(as.factor(cattle.dat.new$COLLAR))
+
+# data in UTM
+cattle.gps.new = st_as_sf(cattle.dat.new, coords = c('LONGITUDE', 'LATITUDE'))
+st_crs(cattle.gps.new) = CRS("+proj=longlat +ellps=WGS84")
+cattle.gps.new$geometry = st_transform(cattle.gps.new$geometry, 
+                         crs = st_crs(drill_pasture))
+
+projection(cattle.gps.new) == projection(drill_pasture)
+
+cattle.utm.new = as_Spatial(cattle.gps.new)
+
+# remove data points outside of Drill Pasture
+test = cattle.utm.new[!is.na(over(cattle.utm.new, as(drill_pasture,
+                                                 'SpatialPolygons'))),]
+
+# remove data points outside of buffered herb area
+selection = !is.na(over(cattle.utm.new, rasterToPolygons(herb.buffered)))
+DPcattle.dat.new = cattle.utm.new[array(selection),]
+
+tm_shape(herb.buffered) + tm_raster() +
+  tm_shape(test) + tm_dots() +
+  tm_shape(drill_pasture) + tm_borders()
+
+rm(cattle.gps.new)
+```
+
+## CLEAN UP DPcattle.dat
+```{r}
+DPcattle.dat.new$date_time =
+  as.POSIXct(DPcattle.dat.new@data[['GMT_TIME']],
+           format = '%Y-%m-%d %H:%M:%S', tz = 'GMT')
+DPcattle.dat.new$date_time =
+  with_tz(DPcattle.dat.new@data[['date_time']], tz = 'US/Mountain')
+```
+
+## Calculate distance from water and salt licks
+```{r}
+# read in KMZ file and convert to UTM
+features = read_sf('Drill 2020 water and salt.kml')
+features$Name = c('trough1', 'trough2', 'trough3', 'trough4', 'trough5',
+                  'salt_lick1', 'salt1', 'salt2', 'salt3', 'salt_lick4', 
+                  'creek_trough')
+features$Description = c('water', 'water', 'water', 'water', 'water', 'salt',
+                         'salt', 'salt', 'salt', 'salt', 'outside')
+features$geometry = st_transform(features$geometry, crs = crs(drill_pasture_sf))
+
+indianCreek = read_sf('indian creek.kml') %>%
+  st_transform(crs = crs(drill_pasture)) %>%
+  st_cast(to = 'POINT')
+indianCreek$Description = rep('water', times = dim(indianCreek)[1])
+
+featuresAll = rbind(features, indianCreek)
+
+# create distance raster
+water = distanceFromPoints(herb.buffered,
+                           st_coordinates(filter(featuresAll, 
+                                                 Description == 'water'))[ ,1:2])
+names(water) = 'close_water'
+salt = distanceFromPoints(herb.buffered,
+                           st_coordinates(filter(featuresAll, 
+                                                 Description == 'salt'))[ ,1:2])
+names(salt) = 'close_salt'
+
+log.water = log(water)
+names(log.water) = 'log_water'
+log.salt = log(salt)
+names(log.salt) = 'log_salt'
+```
+
+## Resample and scale all covariates
+
+### THIS SHOULD BE REVISITED, PER BRIAN'S COMMENTS
+```{r}
+elev.small = resample(elev2, herb.buffered, method = 'ngb') %>%
+  mask(herb.buffered)
+slope.small = resample(slope, herb.buffered$herb, method = 'ngb') %>%
+  mask(herb.buffered)
+ruggedness.small = resample(ruggedness, herb.buffered, method = 'ngb') %>%
+  mask(herb.buffered)
+water.small = resample(log.water, herb.buffered, method = 'ngb') %>%
+  mask(herb.buffered)
+salt.small = resample(log.salt, herb.buffered, method = 'ngb') %>%
+  mask(herb.buffered)
+SHR.small = mask(DPveg$SHR, herb.buffered)
+TREE.small = mask(DPveg$TRE, herb.buffered)
+
+scaled.elev = scale(elev.small, center = T)
+scaled.slope = scale(slope.small, center = T)
+scaled.ruggedness = scale(ruggedness.small, center = T)
+names(scaled.elev) = 'drill_elev'
+names(scaled.slope) = 'slope'
+scaled.water = scale(water.small, center = T)
+scaled.salt = scale(salt.small, center = T)
+names(scaled.water) = 'log_water'
+names(scaled.salt) = 'log_salt'
+scaled.herb = scale(herb.buffered, center = T)
+scaled.SHR = scale(SHR.small, center = T)
+scaled.TREE = scale(TREE.small, center = T)
+
+# scaled.soil = resample(soilClasses2, herb.buffered, method = 'ngb') %>%
+#   scale(center = T)
+# names(scaled.soil) = 'soil_class'
+```
+
+## Load in Roads shapefile
+```{r}
+roads = readOGR("roads San Juan County/roads_49037_2014.shp")
+roads = spTransform(roads, crs(crs(drill_pasture)))
+roads = st_crop(st_as_sf(roads), drill_pasture)
+```
+
+## Calculate activity modes
+```{r}
+# create track for individuals
+DPcattle.frame = as.data.frame(DPcattle.dat.new)
+DPcattle.frame = DPcattle.frame[!is.na(DPcattle.frame$date_time),]
+DPcattle.frame$COLLAR = as.factor(DPcattle.frame$COLLAR)
+DPcattle.list = split(DPcattle.frame, f = DPcattle.frame$COLLAR)
+DPtrack = lapply(DPcattle.list, FUN = mk_track, .x = coords.x1, .y = coords.x2,
+                 .t = date_time, crs = crs(DPcattle.dat.new), order_by_ts = T,
+                 check_duplicates = T)
+DPtrack = DPtrack[-8]
+rm(DPcattle.list)
+
+breeds = distinct(DPcattle.frame[3:4])[order(distinct(DPcattle.frame[4])),]
+
+# calculate velocity from track
+collars = levels(as.factor(DPcattle.dat.new$COLLAR))[-8]
+DPspeed = lapply(DPtrack, FUN = speed)
+for(i in seq(1:length(collars))){
+  c = collars[i]
+  DPtrack[[c]][4] = DPspeed[[c]]
+  names(DPtrack[[c]])[4] = 'speed'
+}
+
+# convert list back into data.frame
+DPspeed.frame = list.rbind(DPtrack)
+temp = array()
+for(i in seq(1:length(collars))){
+  temp = append(temp, rep(collars[i], times = dim(DPtrack[[i]])[1]))
+}
+temp = temp[!is.na(temp)]
+DPspeed.frame$COLLAR = temp
+names(DPspeed.frame)[3] = 'date_time'
+rm(DPtrack)
+
+# merge DPcattle.frame and DPspeed.frame
+DPcattle.frame = merge(DPcattle.frame, DPspeed.frame, 
+                       by = c('COLLAR','date_time'))[-c(15,16),]
+
+# classify activity based on speed (from Nyamuryekung'e et al. 2021a)
+resting = 2.34/60 # max resting speed in m/s
+grazing = 25/60 # max grazing speed in m/s
+DPcattle.frame$activity = array()
+DPcattle.frame$activity[DPcattle.frame$speed <= resting] = 'resting'
+DPcattle.frame$activity[DPcattle.frame$speed > resting &
+                          DPcattle.frame$speed <= grazing] = 'grazing'
+DPcattle.frame$activity[DPcattle.frame$speed > grazing] = 'traveling'
+DPcattle.frame$time = as_hms(DPcattle.frame$date_time)
+
+DPcattle.track = mk_track(DPcattle.frame, .x = coords.x1, .y = coords.x2, 
+                          .t = date_time, COLLAR = COLLAR, BREED = BREED, 
+                          ALTITUDE = ALTITUDE,
+                          TEMPERATURE = TEMPERATURE, DOP = DOP,
+                          SATELLITES = SATELLITES, speed = speed, 
+                          activity = activity, time = time, date = date_time)
+
+```
+
+## Prepare all data for model selection
+```{r}
+# create grid of available points
+# avail.border = st_difference(drill_pasture_sf, buffer) %>%
+#   as_Spatial()
+avail = as.data.frame(herb.buffered, xy = T)
+avail$case_ = rep(0, dim(avail)[1])
+avail = avail[,-3]
+names(avail) = c('x_', 'y_', 'case_')
+avail.small = avail[seq(1,dim(avail)[1],100),] # select every 100th pt
+
+# remove points from first and last three days
+entry = sort(DPcattle.track$date, na.rm = T)[7]
+exit = max(DPcattle.track$date, na.rm = T)
+DPcattle.track.cropped = DPcattle.track %>%
+  filter(date > (entry + 3) & date < (exit - 3))
+DPcattle.frame.cropped = as.data.frame(DPcattle.track.cropped)
+
+# create separate datasets for each activity level for each invididual
+all.list = split(x = DPcattle.track.cropped, 
+                 f = as.factor(DPcattle.track.cropped$COLLAR))[-8]
+all.list = lapply(all.list, `[`, c(1,2))
+```
+
+## LASSO MODEL SELECTION
+No TREE or tri or soil
+```{r}
+set.seed(seed = 1)
+
+HSFmodel = function(used, avail) {
+  used$case_ = 1
+  avail$case_ = 0
+  all.points = rbind(used, avail)
+  all.points = all.points  %>%
+    #attach env covariates to observed and available pts
+    extract_covariates(scaled.elev) %>%
+    extract_covariates(scaled.slope) %>%
+    extract_covariates(scaled.water) %>%
+    extract_covariates(scaled.salt) %>%
+    extract_covariates(scaled.herb) %>%
+    extract_covariates(scaled.SHR) %>%
+    mutate(w = ifelse(case_, 1, 1e3))
+  model = glmnetUtils::cv.glmnet(case_ ~ drill_elev + slope +
+                                   log_water + log_salt + herb + SHR,
+              data = all.points, weights = w,
+                   family = binomial(link = 'logit'))
+  return(model)
+}
+
+all.model.list8 = lapply(X = all.list, FUN = HSFmodel, avail = avail)
+
+indivBreed = c("80333 - Angus", "80335 - Angus", "80338 - Criollo",
+               "80339 - Angus", "80342 - Criollo", "80343 - Angus",
+               "80344 - Criollo", "80349 - Criollo", "80351 - Criollo")
+
+cf.all = cbind(
+  as.array(coef(all.model.list8[[1]])), as.array(coef(all.model.list8[[2]])),
+  as.array(coef(all.model.list8[[3]])), as.array(coef(all.model.list8[[4]])),
+  as.array(coef(all.model.list8[[5]])), as.array(coef(all.model.list8[[6]])),
+  as.array(coef(all.model.list8[[7]])), as.array(coef(all.model.list8[[8]])),
+  as.array(coef(all.model.list8[[9]])))
+colnames(cf.all) = indivBreed
+write.csv(cf.all, 'coefficientsAll.LASSO - with RAP and soil.csv')
+
+```
+
+## CREATE USE INTENSITY RASTER
+```{r}
+createRaster = function(coef) {
+  rest.raster =
+    scaled.elev * coef[2] +
+    scaled.slope * coef[3] +
+    scaled.water * coef[4] +
+    scaled.salt * coef[5] +
+    scaled.herb * coef[6] +
+    scaled.SHR * coef[7]
+  rest.raster = exp(rest.raster)
+  rest.raster = rest.raster / sum(as.data.frame(rest.raster, na.rm = T))
+  return(rest.raster)
+}
+
+MasterRasterSimple = stack(apply(X = cf.all, FUN = createRaster, MARGIN = 2))
+MeanAngusAll = calc(MasterRasterSimple[[c(1,2,4,6)]], fun = mean)
+MeanCriolloAll = calc(MasterRasterSimple[[c(3,5,7,8,9)]], fun = mean)
+MasterRasterSimple = addLayer(MasterRasterSimple, c(MeanAngusAll, MeanCriolloAll))
+names(MasterRasterSimple) = c(indivBreed, 'Angus', 'Criollo')
+plot((MasterRasterSimple[[10:11]]))
+MasterFrameAll = as.data.frame(MasterRasterSimple, xy = T) %>%
+  pivot_longer(cols = 3:13)
+names(MasterFrameAll) = c('x', 'y', 'BREED', 'value')
+
+ggplot() +
+  geom_raster(data = subset(MasterFrameAll, BREED == 'Angus' |
+                              BREED == 'Criollo'),
+              aes(x = x, y = y, fill = value)) +
+  scale_fill_viridis_c(na.value = 'white', option = 'turbo', direction = 1,
+                       trans = 'log') +
+  geom_point(data = DPcattle.track.cropped, aes(x = x_, y = y_),
+             alpha = 0.2, size = 0.1) +
+  # geom_sf(data = roads, color = 'white') +
+  coord_sf(datum = sf::st_crs(drill_pasture)) +
+  facet_wrap(~BREED) + 
+  scale_x_continuous(breaks = seq(621000, 624000, length.out = 2)) +
+  scale_y_continuous(breaks = seq(4221000, 4225000, length.out = 3)) +
+  theme(text = element_text(color = "black", size = 20),
+        legend.key.size = unit(1.5, 'cm')) +
+  labs(title = 'Mean Relative Use Intensity', fill = 'Log(Intensity)')
+
+# ggsave('log relative use.png', plot = last_plot(),
+#   width = 10, height = 7, units = 'in', dpi = 300, limitsize = TRUE)
+# 
+# k =  projectRaster(log(MasterRasterSimple[[10]]),
+#                    crs="+proj=longlat +datum=WGS84", method='ngb')
+# KML(k, filename = 'Angus', overwrite = T)
+# l =  projectRaster(log(MasterRasterSimple[[11]]),
+#                    crs="+proj=longlat +datum=WGS84", method='ngb')
+# KML(l, filename = 'Criollo', overwrite = T)
+
+```
+
+## Make a map for Eric
+```{r}
+ggplot() +
+  geom_raster(data = subset(MasterFrameAll, BREED == 'Angus' | 
+                              BREED == 'Criollo'),
+              aes(x = x, y = y, fill = value)) +
+  scale_fill_viridis_c(na.value = 'white', option = 'turbo', direction = 1,
+                       trans = 'log') +
+  geom_sf(data = features[1:10,], aes(shape = Description), alpha = 0.8) +
+  coord_sf(datum = sf::st_crs(drill_pasture)) +
+  facet_wrap(~BREED) + 
+  scale_x_continuous(breaks = seq(621000, 624000, length.out = 2)) +
+  scale_y_continuous(breaks = seq(4221000, 4225000, length.out = 3)) +
+  theme(text = element_text(color = "black", size = 20),
+        legend.key.size = unit(1.5, 'cm'),
+        panel.background = element_rect(fill = "transparent"),
+        plot.background = element_rect(fill = "transparent", color = NA), 
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank()) +
+  labs(title = 'Mean Relative Use Intensity', shape = 'Feature Type', 
+       fill = 'Log(Intensity)')
+
+ggsave('Angus Rel Use with Features.png', plot = last_plot(),
+  width = 12, height = 7, units = 'in', dpi = 300, limitsize = TRUE)
+```
+
